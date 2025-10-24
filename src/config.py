@@ -227,7 +227,7 @@ class StrategyConfig:
 
     use_postonly_entries = True
 
-        # RSI conditions
+        # RSI conditionsS
     rsi_oversold: float = 30.0
     rsi_overbought: float = 70.0
 
@@ -245,6 +245,15 @@ class StrategyConfig:
     range_upper_bound_percentile: float = 0.7  # レンジ上限（0.7は例）
     range_lower_bound_percentile: float = 0.3  # レンジ下限
 
+    # === Entry Guard (SMA10 / RSI) ==============================
+    # LONG：close > SMA10 を必須にする
+    require_close_gt_sma10_long: bool = True
+    # SHORT：close < SMA10 を必須にする
+    require_close_lt_sma10_short: bool = True
+    # LONG側のRSI下限（推奨 55）
+    rsi_long_min: float = 70.0
+    # SHORT側のRSI上限（推奨 50）
+    rsi_short_max: float = 30.0
 
 APP = AppConfig()
 API = ApiConfig()

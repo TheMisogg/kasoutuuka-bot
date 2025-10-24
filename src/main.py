@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, Any
 
 # .env 読み込み
-from env import load_env
+from .env import load_env
 load_env()
 
 from config import STRATEGY as S, API

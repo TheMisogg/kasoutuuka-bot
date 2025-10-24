@@ -198,6 +198,13 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
     s10   = float(ctx.get("sma10", price))
     s50   = float(ctx.get("sma50", s10))
     atr   = float(ctx.get("atr", 0.0)) or 1e-9
+    rsi   = float(ctx.get("rsi", ctx.get("rsi14", 50.0)))
+
+    # --- SMA10 / RSI の絶対ガード ---
+    if getattr(S, "require_close_gt_sma10_long", True) and not (price > s10):
+        return (False, "close≤SMA10(guard)")
+    if rsi < float(getattr(S, "rsi_long_min", 55.0)):
+        return (False, f"RSI<{int(getattr(S, 'rsi_long_min', 55))}(guard)")    
 
     regime = classify_regime(ctx)
     relax_tags = []
@@ -348,6 +355,13 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
     s10   = float(ctx.get("sma10", price))
     s50   = float(ctx.get("sma50", s10))
     atr   = float(ctx.get("atr", 0.0)) or 1e-9
+    rsi   = float(ctx.get("rsi", ctx.get("rsi14", 50.0)))
+
+    # --- SMA10 / RSI の絶対ガード ---
+    if getattr(S, "require_close_lt_sma10_short", True) and not (price < s10):
+        return (False, "close≥SMA10(guard)")
+    if rsi > float(getattr(S, "rsi_short_max", 50.0)):
+        return (False, f"RSI>{int(getattr(S, 'rsi_short_max', 50))}(guard)")
 
     regime = classify_regime(ctx)  # "trend_up" / "neutral" / "range"
     relax_tags = []
