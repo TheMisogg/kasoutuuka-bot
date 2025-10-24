@@ -8,8 +8,8 @@ flow_filters_dynamic.py — dynamic entry guard with explain tags.
 from __future__ import annotations
 from typing import Dict, Any, Tuple
 
-from config import STRATEGY as S
-from flow_filters import compute_flow_metrics, compute_wall_pressure
+from .config import STRATEGY as S
+from .flow_filters import compute_flow_metrics, compute_wall_pressure
 
 # =========================
 # 強制フリップ（反転）サポート

@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Tuple
 import time, requests
 
 try:
-    from config import API
+    from .config import API
     BASE = getattr(API, "base_url", "https://api.bybit.com")
 except Exception:
     BASE = "https://api.bybit.com"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os, time, hmac, hashlib, json, urllib.request
 from typing import Dict, Any, List, Tuple
 from urllib.parse import urlencode
-from config import API
+from .config import API
 
 def _ts_ms() -> int:
     return int(time.time() * 1000)
