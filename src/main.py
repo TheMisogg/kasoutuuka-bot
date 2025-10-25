@@ -41,7 +41,7 @@ from .flow_filters_dynamic import (
 # ===== bybit.py の関数名差異に自動対応（get_klines_linearが無くてもOK）=====
 from typing import Optional
 try:
-    import bybit as _bx_loaded
+    from .import bybit as _bx_loaded
     _bx: Optional[ModuleType] = _bx_loaded
 except Exception:
     _bx = None  
