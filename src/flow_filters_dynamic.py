@@ -109,35 +109,42 @@ def _should_force_flip(requested_side: str, edge, *, S=None) -> Tuple[bool, Dict
     return (votes >= need, {"metrics": m, "ofi_clipped": ofi, "ofi_suspect": ofi_sus})
 
 def classify_regime(ctx: Dict[str, Any]) -> str:
+    """
+    市況レジームを4区分で返す:
+      - "trend_up"   : 上昇トレンド
+      - "trend_down" : 下降トレンド
+      - "range"      : ボラ小さく平均回帰優位
+      - "neutral"    : 上記いずれでもない中庸
+    しきい値は config(STRATEGY) があれば優先する。
+    """
     price = float(ctx.get("price", 0.0)) or 1.0
-    atr = float(ctx.get("atr", 0.0))
+    atr   = float(ctx.get("atr", 0.0))
+    adx   = float(ctx.get("adx", 0.0))
+    s10   = float(ctx.get("sma10", price))
+    s50   = float(ctx.get("sma50", s10))
+    macd  = float(ctx.get("macd", 0.0))
+    msig  = float(ctx.get("macd_sig", 0.0))
+
     atrp = (atr / price) if price else 0.0
-    adx = float(ctx.get("adx", 0.0))
-    s10 = float(ctx.get("sma10", price))
-    s50 = float(ctx.get("sma50", s10))
-    
-    # トレンド判定を厳格化
-    trend_strength = 0
-    if (atrp >= float(S.atrp_trend_min) or adx >= float(S.adx_trend_min)):
-        trend_strength += 1
-    if s10 >= s50:
-        trend_strength += 1
-    if ctx.get("macd", 0) > ctx.get("macd_sig", 0):
-        trend_strength += 1
-    
-    # 強いトレンド判定
-    if trend_strength >= 2 and adx >= 25:  # ADXが25以上で強いトレンド
-        if s10 > s50:
-            return "trend_strong_long"
-        else:
-            return "trend_strong_short"
-    elif trend_strength >= 2:
-        return "trend_up"
-    
-    # レンジ判定を改善
-    if atrp < 0.004 and abs(s10 - s50) < (0.3 * atr):  # より厳格なレンジ判定
+
+    # --- 1) 先に「レンジ」を判定（ボラが十分小さく、短長MAが収束）---
+    rng_atrp_max      = float(getattr(S, "atrp_range_max", 0.004))
+    sma_conf_atr_mult = float(getattr(S, "sma_confluence_atr_k", 0.30))  # |s10-s50| <= k*ATR
+    if (atrp <= rng_atrp_max) and (abs(s10 - s50) <= (sma_conf_atr_mult * max(atr, 1e-9))):
         return "range"
-    
+
+    # --- 2) トレンドの“ゲート”を通過（ボラ or ADX）---
+    gate_trend = (atrp >= float(getattr(S, "atrp_trend_min", 0.006))) \
+                 or (adx  >= float(getattr(S, "adx_trend_min", 20.0)))
+
+    if gate_trend:
+        # 方向性はMAとMACDの整合で確定
+        if (s10 > s50) and (macd >= msig):
+            return "trend_up"
+        if (s10 < s50) and (macd <= msig):
+            return "trend_down"
+
+    # --- 3) どちらにも振り切れていなければ neutral ---
     return "neutral"
 
 # レンジ上限/下限判定関数を追加
@@ -232,7 +239,7 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
     k_trend   = float(getattr(S, "entry_max_over_sma10_atr_trend", 1.50))
     k_neutral = float(getattr(S, "entry_max_over_sma10_atr_neutral", 0.70))
     k_range   = float(getattr(S, "entry_max_over_sma10_atr_range", 0.55))
-    k_cap_base = k_trend if regime == "trend_up" else (k_range if regime == "range" else k_neutral)
+    k_cap_base = k_trend if regime in ("trend_up", "trend_down") else (k_range if regime == "range" else k_neutral)
 
     votes = int(ctx.get("edge_votes", 0))
     ofi_z = float(ctx.get("ofi_z", 0.0))
@@ -365,7 +372,7 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
     if rsi > float(getattr(S, "rsi_short_max", 50.0)):
         return (False, f"RSI>{int(getattr(S, 'rsi_short_max', 50))}(guard)")
 
-    regime = classify_regime(ctx)  # "trend_up" / "neutral" / "range"
+    regime = classify_regime(ctx)  # "trend_up" / "trend_down" / "range" / "neutral"
     ctx["regime"] = regime
     relax_tags = []
 
@@ -386,7 +393,7 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
     k_trend   = float(getattr(S, "entry_max_over_sma10_atr_trend", 1.50))
     k_neutral = float(getattr(S, "entry_max_over_sma10_atr_neutral", 0.70))
     k_range   = float(getattr(S, "entry_max_over_sma10_atr_range", 0.55))
-    k_cap_base = k_trend if regime == "trend_up" else (k_range if regime == "range" else k_neutral)
+    k_cap_base = k_trend if regime in ("trend_up", "trend_down") else (k_range if regime == "range" else k_neutral)
 
     votes = int(ctx.get("edge_votes", 0))
     ofi_z = float(ctx.get("ofi_z", 0.0))
@@ -447,7 +454,7 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
     # --- (3) Orderbook soft guard（ask 優勢を要求）---
     if bool(getattr(S, "use_orderbook_filter", True)):
         ob_ratio, _, _ = compute_wall_pressure(book, int(getattr(S, "ob_depth", 50)))
-        base_max = float(getattr(S, "ob_ask_bid_max_trend" if regime=="trend_up" else ("ob_ask_bid_max_range" if regime=="range" else "ob_ask_bid_max_neutral"), 0.80))
+        base_max = float(getattr(S, "ob_ask_bid_max_trend" if regime in ("trend_up","trend_down") else ("ob_ask_bid_max_range" if regime=="range" else "ob_ask_bid_max_neutral"), 0.80))
         relax = float(getattr(S, "ob_relax_band", 0.05))
         # SHORTは ask/bid が十分大（=1/ratio が十分小）であることを確認
         ratio_inv = (1.0 / ob_ratio) if ob_ratio > 0 else float("inf")
@@ -485,7 +492,7 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
               f"flowL(rate={int(fm_l.get('rate_usd',0))}/s net={int(fm_l.get('net_usd',0))})")
     if bool(getattr(S, "use_orderbook_filter", True)):
         ob_ratio, _, _ = compute_wall_pressure(book, int(getattr(S, 'ob_depth',50)))
-        base_max = float(getattr(S, "ob_ask_bid_max_trend" if regime=="trend_up" else ("ob_ask_bid_max_range" if regime=="range" else "ob_ask_bid_max_neutral"), 0.80))
+        base_max = float(getattr(S, "ob_ask_bid_max_trend" if regime in ("trend_up","trend_down") else ("ob_ask_bid_max_range" if regime=="range" else "ob_ask_bid_max_neutral"), 0.80))
         relax = float(getattr(S, "ob_relax_band", 0.05))
         base_min_show = (1.0 / base_max) if base_max > 0 else float('inf')
         ok_msg += f" | ob={ob_ratio:.2f} (min {base_min_show:.2f}±{relax:.2f})"
