@@ -207,6 +207,8 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
         return (False, f"RSI<{int(getattr(S, 'rsi_long_min', 55))}(guard)")    
 
     regime = classify_regime(ctx)
+    # 呼び出し元（main.py）から参照できるように、ctxに格納しておく（戻り値は従来どおり）
+    ctx["regime"] = regime
     relax_tags = []
     # === ブル・レジーム中は SHORT 原則禁止（例外：カピチュレーションSHORT） ===
     if regime == "trend_up":
@@ -364,6 +366,7 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
         return (False, f"RSI>{int(getattr(S, 'rsi_short_max', 50))}(guard)")
 
     regime = classify_regime(ctx)  # "trend_up" / "neutral" / "range"
+    ctx["regime"] = regime
     relax_tags = []
 
     # --- (1) Pullback rule for SHORT (上方向への戻り待ち) ---

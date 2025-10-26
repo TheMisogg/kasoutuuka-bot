@@ -1433,9 +1433,11 @@ def run_loop():
                 if sig == "SHORT" and getattr(S, "allow_shorts", True):
                     ok, why = decide_entry_guard_short(tlist, book, ctx, S)
                     side_for_entry = "SHORT"
+                    notify_slack(f":triangular_ruler: Regime={ctx.get('regime','unknown')} | SHORT guard → {why or 'OK'}")
                 else:
                     ok, why = decide_entry_guard_long(tlist, book, ctx, S)
                     side_for_entry = "LONG"
+                    notify_slack(f":triangular_ruler: Regime={ctx.get('regime','unknown')} | LONG guard → {why or 'OK'}")
             except Exception as e:
                 why = f"guard-eval exception: {e!s}"
                 notify_slack(f":x: 例外: {why}")
