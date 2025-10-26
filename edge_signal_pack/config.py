@@ -19,7 +19,7 @@ OFI_Z_THR      = float(os.getenv("OFI_Z_THR", "2.0"))
 
 # === CVD（累積Delta） ===
 CVD_EMA = int(os.getenv("CVD_EMA", "20"))
-SEQ_MKT_TICKS = int(os.getenv("SEQ_MKT_TICKS", "6"))  # 1秒足の連続成行
+SEQ_MKT_TICKS = int(os.getenv("SEQ_MKT_TICKS", "20"))  # 1秒足の連続成行
 
 # === 清算クラスター ===
 LIQ_USE = os.getenv("LIQ_USE", "1") == "1"
