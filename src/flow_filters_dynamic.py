@@ -110,43 +110,117 @@ def _should_force_flip(requested_side: str, edge, *, S=None) -> Tuple[bool, Dict
 
 def classify_regime(ctx: Dict[str, Any]) -> str:
     """
-    市況レジームを4区分で返す:
-      - "trend_up"   : 上昇トレンド
-      - "trend_down" : 下降トレンド
-      - "range"      : ボラ小さく平均回帰優位
-      - "neutral"    : 上記いずれでもない中庸
-    しきい値は config(STRATEGY) があれば優先する。
+    市況レジームを4分類で返す:
+      - "trend_up" / "trend_down" / "range" / "neutral"
+    併せて、マルチタイムフレーム整合や“強さスコア”を ctx にメタ情報として格納する。
+    （戻り値はレジーム名のみ。強トレンドかどうかの最終判断は main.py 側で合成）
     """
-    price = float(ctx.get("price", 0.0)) or 1.0
-    atr   = float(ctx.get("atr", 0.0))
-    adx   = float(ctx.get("adx", 0.0))
-    s10   = float(ctx.get("sma10", price))
-    s50   = float(ctx.get("sma50", s10))
-    macd  = float(ctx.get("macd", 0.0))
-    msig  = float(ctx.get("macd_sig", 0.0))
+    # --- 安全取得 ---
+    def _g(name: str, default=0.0, t=float):
+        try:
+            v = ctx.get(name, default)
+            return t(v)
+        except Exception:
+            return t(default)
 
-    atrp = (atr / price) if price else 0.0
+    price = _g("price", 0.0) or 1.0
+    atr   = _g("atr", 0.0)
+    adx   = _g("adx", 0.0)  # 5m
+    s10   = _g("sma10", _g("ema9", price))
+    s50   = _g("sma50", _g("ema21", s10))
+    macd  = _g("macd", 0.0)
+    msig  = _g("macd_sig", 0.0)
+    rsi   = _g("rsi14", _g("rsi", 50.0))
+    atrp  = (atr / price) if price else 0.0
 
-    # --- 1) 先に「レンジ」を判定（ボラが十分小さく、短長MAが収束）---
-    rng_atrp_max      = float(getattr(S, "atrp_range_max", 0.004))
+    # --- まず「レンジ」を先判定（ボラ小&短長MA収束） ---
+    rng_atrp_max      = float(getattr(S, "atrp_range_max", 0.005))
     sma_conf_atr_mult = float(getattr(S, "sma_confluence_atr_k", 0.30))  # |s10-s50| <= k*ATR
     if (atrp <= rng_atrp_max) and (abs(s10 - s50) <= (sma_conf_atr_mult * max(atr, 1e-9))):
+        ctx["mtf_align"] = "none"
+        ctx["strong_score_up"] = 0
+        ctx["strong_score_down"] = 0
         return "range"
 
-    # --- 2) トレンドの“ゲート”を通過（ボラ or ADX）---
-    gate_trend = (atrp >= float(getattr(S, "atrp_trend_min", 0.006))) \
-                 or (adx  >= float(getattr(S, "adx_trend_min", 20.0)))
+    # --- MTF整合（5m × 15m/1h）: EMA9/EMA21 + ADX ---
+    adx_5m_min  = float(getattr(S, "adx_5m_min", 25.0))
+    adx_15m_min = float(getattr(S, "adx_15m_min", 20.0))
+    adx_1h_min  = float(getattr(S, "adx_1h_min", 18.0))
+
+    ema9_5  = _g("ema9",  _g("sma10", s10))
+    ema21_5 = _g("ema21", _g("sma50", s50))
+    ema9_15 = _g("ema9_15m",  _g("sma10_15m", ema9_5))
+    ema21_15= _g("ema21_15m", _g("sma50_15m", ema21_5))
+    ema9_1h = _g("ema9_1h",   _g("sma10_1h",  ema9_5))
+    ema21_1h= _g("ema21_1h",  _g("sma50_1h",  ema21_5))
+    adx_15  = _g("adx_15m", _g("adx15", 0.0))
+    adx_1h  = _g("adx_1h",  _g("adx60", 0.0))
+
+    m5_up   = (adx >= adx_5m_min)  and (ema9_5  > ema21_5)
+    m5_down = (adx >= adx_5m_min)  and (ema9_5  < ema21_5)
+    m15_up  = (adx_15 >= adx_15m_min) and (ema9_15 > ema21_15)
+    m15_down= (adx_15 >= adx_15m_min) and (ema9_15 < ema21_15)
+    h1_up   = (adx_1h >= adx_1h_min)   and (ema9_1h > ema21_1h)
+    h1_down = (adx_1h >= adx_1h_min)   and (ema9_1h < ema21_1h)
+
+    align_up   = m5_up   and (m15_up or h1_up)
+    align_down = m5_down and (m15_down or h1_down)
+    ctx["mtf_align"] = "up" if align_up else ("down" if align_down else "none")
+
+    # --- “強さスコア”（上昇/下降を別々に採点） ---
+    # 使える値が無ければ各条件はFalse扱い（堅牢化）
+    # MA整列: ema_fast > ema_mid > ema_slow（無ければ fast>mid 判定のみ）
+    ema_fast = ema9_5
+    ema_mid  = ema21_5
+    ema_slow = _g("ema50", _g("sma200", ema_mid + 1.0))
+    have_slow= ("ema50" in ctx) or ("sma200" in ctx)
+    ma_up    = (ema_fast > ema_mid) and (ema_mid > ema_slow if have_slow else True)
+    ma_down  = (ema_fast < ema_mid) and (ema_mid < ema_slow if have_slow else True)
+
+    adx_strong = adx >= float(getattr(S, "adx_strong_min", 25.0))
+    vol        = _g("volume", _g("vol", 0.0))
+    vol_ma     = _g("vol_ma", _g("volume_ma", 0.0))
+    vol_exp    = (vol_ma > 0.0) and (vol > vol_ma * float(getattr(S, "volume_expand_k", 1.2)))
+    bbw        = _g("bb_width", _g("bb_w", 0.0))
+    bbw_ma     = _g("bb_width_ma", _g("bb_w_ma", 0.0))
+    bb_expand  = (bbw_ma > 0.0) and (bbw > bbw_ma)
+    mh         = _g("macd_hist", _g("macd_histogram", 0.0))
+    mh_prev    = _g("macd_hist_prev", _g("macd_hist_1", mh))
+    mh_up      = (mh > 0.0) and (mh >= mh_prev)
+    mh_down    = (mh < 0.0) and (mh <= mh_prev)
+
+    rsi_up     = (rsi >= float(getattr(S, "rsi_strong_min", 60.0))) and (rsi <= float(getattr(S, "rsi_strong_max", 80.0)))
+    rsi_down   = (rsi <= float(getattr(S, "rsi_weak_max", 40.0)))   and (rsi >= float(getattr(S, "rsi_weak_min", 20.0)))
+
+    strong_score_up   = int(adx_strong) + int(ma_up)   + int(rsi_up)   + int(vol_exp) + int(bb_expand) + int(mh_up)
+    strong_score_down = int(adx_strong) + int(ma_down) + int(rsi_down) + int(vol_exp) + int(bb_expand) + int(mh_down)
+    ctx["strong_score_up"] = strong_score_up
+    ctx["strong_score_down"] = strong_score_down
+
+    # --- トレンド“ゲート”: ATR%/ADX のモード切替（OR/AND/ADX/ATR） ---
+    mode     = str(getattr(S, "trend_gate_mode", "OR")).upper()
+    atr_gate = atrp >= float(getattr(S, "atrp_trend_min", 0.008))
+    adx_gate = adx  >= float(getattr(S, "adx_trend_min", 20.0))
+    if mode == "AND":
+        gate_trend = atr_gate and adx_gate
+    elif mode == "ADX":
+        gate_trend = adx_gate
+    elif mode == "ATR":
+        gate_trend = atr_gate
+    else:  # "OR"
+        gate_trend = atr_gate or adx_gate
+
+    # --- 方向確定（MTF整合があれば優先、無ければ5mのMA+MACD整合） ---
+    up_dir   = (s10 > s50 and macd >= msig) or align_up
+    down_dir = (s10 < s50 and macd <= msig) or align_down
 
     if gate_trend:
-        # 方向性はMAとMACDの整合で確定
-        if (s10 > s50) and (macd >= msig):
+        if up_dir and not down_dir:
             return "trend_up"
-        if (s10 < s50) and (macd <= msig):
+        if down_dir and not up_dir:
             return "trend_down"
-
-    # --- 3) どちらにも振り切れていなければ neutral ---
+    
     return "neutral"
-
 # レンジ上限/下限判定関数を追加
 def is_range_upper(ctx: Dict[str, Any]) -> bool:
     """レンジ上限付近か判定"""
@@ -206,6 +280,9 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
     s50   = float(ctx.get("sma50", s10))
     atr   = float(ctx.get("atr", 0.0)) or 1e-9
     rsi   = float(ctx.get("rsi", ctx.get("rsi14", 50.0)))
+    # --- Regime classify (Slack 表示用にガード前で設定) ---
+    regime = classify_regime(ctx) # "trend_up" / "trend_down" / "range" / "neutral"
+    ctx["regime"] = regime
 
     # --- SMA10 / RSI の絶対ガード ---
     if getattr(S, "require_close_gt_sma10_long", True) and not (price > s10):
@@ -213,9 +290,6 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
     if rsi < float(getattr(S, "rsi_long_min", 55.0)):
         return (False, f"RSI<{int(getattr(S, 'rsi_long_min', 55))}(guard)")    
 
-    regime = classify_regime(ctx)
-    # 呼び出し元（main.py）から参照できるように、ctxに格納しておく（戻り値は従来どおり）
-    ctx["regime"] = regime
     relax_tags = []
     # === ブル・レジーム中は SHORT 原則禁止（例外：カピチュレーションSHORT） ===
     if regime == "trend_up":
@@ -365,15 +439,15 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
     s50   = float(ctx.get("sma50", s10))
     atr   = float(ctx.get("atr", 0.0)) or 1e-9
     rsi   = float(ctx.get("rsi", ctx.get("rsi14", 50.0)))
-
+    # --- Regime classify (Slack 表示用にガード前で設定) ---
+    regime = classify_regime(ctx) # "trend_up" / "trend_down" / "range" / "neutral"
+    ctx["regime"] = regime
     # --- SMA10 / RSI の絶対ガード ---
     if getattr(S, "require_close_lt_sma10_short", True) and not (price < s10):
         return (False, "close≥SMA10(guard)")
     if rsi > float(getattr(S, "rsi_short_max", 50.0)):
         return (False, f"RSI>{int(getattr(S, 'rsi_short_max', 50))}(guard)")
 
-    regime = classify_regime(ctx)  # "trend_up" / "trend_down" / "range" / "neutral"
-    ctx["regime"] = regime
     relax_tags = []
 
     # --- (1) Pullback rule for SHORT (上方向への戻り待ち) ---

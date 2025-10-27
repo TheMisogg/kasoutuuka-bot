@@ -162,16 +162,26 @@ def _apply_flip_overrides_if_any(side: str, qty: float, overrides: dict):
         return qty, ""
     
 # --- Adaptive TP/SL profile selector -----------------------------------------
-def _decide_tp_sl_profile(regime: str, side: str, votes: int, ofi_z: float, S=S) -> dict:
+def _decide_tp_sl_profile(regime: str, side: str, votes: int, ofi_z: float, ctx: dict | None = None, S=S) -> dict:
     """
     レジーム/フローに応じて TP/SL 管理プロファイルを決定。
     返り値例: {"name":"trend_strong_long", "sl_k":1.2, "tp_rr":2.0, "be_k":0.6}
               {"name":"range", "sl_k":0.7, "tp_rr":1.0, "trail_k":0.5}
     """
-    # “強トレンド＆フロー合致”の判定（票数＋OFI z）
-    need_votes = int(getattr(S, "trend_votes_min", 2))
-    need_ofi_z = float(getattr(S, "trend_ofi_z_min", 1.5))
-    aligned = (votes >= need_votes) and (ofi_z >= need_ofi_z)
+    # “強トレンド合致”の判定
+    # 票数＋OFI z に加え、MTF整合/強さスコアでも強トレンド扱いにする
+    need_votes   = int(getattr(S, "trend_votes_min", 2))
+    need_ofi_z   = float(getattr(S, "trend_ofi_z_min", 1.5))
+    score_min    = int(getattr(S, "strong_score_min", 4))
+    # ctx は任意（None可）→ 無ければ MTF/スコアは不使用扱い
+    _ctx         = ctx or {}
+    mtf_align    = _ctx.get("mtf_align", "none")
+    score_up     = int(_ctx.get("strong_score_up", 0))
+    score_down   = int(_ctx.get("strong_score_down", 0))
+    aligned_flow = (votes >= need_votes) and ((ofi_z >=  need_ofi_z) if side == "LONG" else (ofi_z <= -need_ofi_z))
+    aligned_mtf  = (mtf_align == ("up" if side == "LONG" else "down")) if ctx else False
+    aligned_scr  = ((score_up >= score_min) if side == "LONG" else (score_down >= score_min)) if ctx else False
+    aligned      = aligned_flow or aligned_mtf or aligned_scr
 
     if regime == "range":
         return {
@@ -1468,7 +1478,18 @@ def run_loop():
                     continue
 
             # === ここにレジーム別戦略最適化のコードを追加 ===
-            regime = classify_regime(ctx)    
+            regime = classify_regime(ctx)
+
+            # 旧 trend_strong_* の代替（MTF整合/強さスコア/フロー）
+            need_votes = int(getattr(S, "trend_votes_min", 2))
+            need_ofi_z = float(getattr(S, "trend_ofi_z_min", 1.5))
+            score_min  = int(getattr(S, "strong_score_min", 4))
+            mtf_align  = ctx.get("mtf_align", "none")
+            score_up   = int(ctx.get("strong_score_up", 0))
+            score_down = int(ctx.get("strong_score_down", 0))
+            ofi_local  = float(ctx.get("ofi_z", ofi_z if "ofi_z" in locals() else 0.0))
+            strong_up   = (regime == "trend_up")   and ( (edge_votes >= need_votes and ofi_local >=  need_ofi_z) or (mtf_align == "up")   or (score_up   >= score_min) )
+            strong_down = (regime == "trend_down") and ( (edge_votes >= need_votes and ofi_local <= -need_ofi_z) or (mtf_align == "down") or (score_down >= score_min) )
 
             # レジーム別戦略最適化
             if regime == "range":
@@ -1490,7 +1511,7 @@ def run_loop():
                     time.sleep(float(S.poll_interval_sec))
                     continue
 
-            elif regime == "trend_strong_long":
+            elif strong_up:
                 # 強い上昇トレンド: LONGのみ許可
                 if side_for_entry == "SHORT":
                     _bump_skip(state, "regime_not_ok")
@@ -1502,7 +1523,7 @@ def run_loop():
                     continue
 
 
-            elif regime == "trend_strong_short":
+            elif strong_down:
                 # 強い下降トレンド: LONG禁止 ← この処理を追加
                 if side_for_entry == "LONG":
                     _bump_skip(state, "regime_not_ok")
@@ -1549,7 +1570,7 @@ def run_loop():
                 regime = classify_regime(ctx)            # "trend_up" / "neutral" / "range"
                 side   = side_for_entry                  # "LONG" or "SHORT"
 
-                prof = _decide_tp_sl_profile(regime, side, edge_votes, ofi_z, S)
+                prof = _decide_tp_sl_profile(regime, side_for_entry, edge_votes, ofi_z, ctx, S)
                 sl_k  = float(prof["sl_k"])
                 tp_rr = float(prof["tp_rr"])
 

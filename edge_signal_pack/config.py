@@ -5,13 +5,13 @@ SYMBOL = os.getenv("SYMBOL", "SOLUSDT")
 TIMEFRAME_BASE = os.getenv("TIMEFRAME_BASE", "5m")   # "5m" or "15m"
 
 # === レジーム判定 ===
-ATR_PCT_THR = float(os.getenv("ATR_PCT_THR", "0.006"))  # 0.8% = 0.008
+ATR_PCT_THR = float(os.getenv("ATR_PCT_THR", "0.010"))  # 0.8% = 0.008
 ADX_THR      = float(os.getenv("ADX_THR", "16"))
 
 
 # === OBI（板不均衡） ===
 OBI_LEVELS = int(os.getenv("OBI_LEVELS", "8"))
-OBI_THR    = float(os.getenv("OBI_THR", "0.5"))
+OBI_THR    = float(os.getenv("OBI_THR", "0.6"))
 
 # === OFI（約定フロー不均衡） ===
 OFI_WINDOW_SEC = int(os.getenv("OFI_WINDOW_SEC", "30"))
@@ -23,7 +23,7 @@ SEQ_MKT_TICKS = int(os.getenv("SEQ_MKT_TICKS", "20"))  # 1秒足の連続成行
 
 # === 清算クラスター ===
 LIQ_USE = os.getenv("LIQ_USE", "1") == "1"
-LIQ_CLUSTER_PCT = float(os.getenv("LIQ_CLUSTER_PCT", "0.003"))  # 0.3%
+LIQ_CLUSTER_PCT = float(os.getenv("LIQ_CLUSTER_PCT", "0.02"))  # 2%
 LIQ_CLUSTER_USD = float(os.getenv("LIQ_CLUSTER_USD", "200000"))
 
 # === ΔOI ===
