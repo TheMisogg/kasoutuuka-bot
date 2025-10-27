@@ -133,14 +133,36 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
     rsi   = _g("rsi14", _g("rsi", 50.0))
     atrp  = (atr / price) if price else 0.0
 
+        # === 追加1: 流動性確認（最初にチェック）===
+    volume_24h_avg = _g("volume_24h_avg", 0.0)
+    current_volume = _g("volume", _g("vol", 0.0))
+    low_liquidity = (volume_24h_avg > 0 and 
+                    current_volume < volume_24h_avg * 0.3)
+    
+    if low_liquidity:
+        ctx["low_liquidity"] = True
+        ctx["mtf_align"] = "none"
+        ctx["strong_score_up"] = 0
+        ctx["strong_score_down"] = 0
+        return "neutral"  # 流動性低下時は中立判定
+
     # --- まず「レンジ」を先判定（ボラ小&短長MA収束） ---
-    rng_atrp_max      = float(getattr(S, "atrp_range_max", 0.005))
+    rng_atrp_max      = float(getattr(S, "atrp_range_max", 0.008))
     sma_conf_atr_mult = float(getattr(S, "sma_confluence_atr_k", 0.30))  # |s10-s50| <= k*ATR
     if (atrp <= rng_atrp_max) and (abs(s10 - s50) <= (sma_conf_atr_mult * max(atr, 1e-9))):
         ctx["mtf_align"] = "none"
         ctx["strong_score_up"] = 0
         ctx["strong_score_down"] = 0
         return "range"
+
+    # === 追加2: 急激な価格変動の検出 ===
+    price_5m_ago = _g("price_5m_ago", _g("price_prev", price))
+    price_change_5m = abs(price - price_5m_ago) / (price_5m_ago or 1.0)
+    sudden_move = price_change_5m > 0.03  # 5分で3%以上
+    
+    if sudden_move:
+        ctx["sudden_move"] = True
+        ctx["price_change_5m"] = price_change_5m
 
     # --- MTF整合（5m × 15m/1h）: EMA9/EMA21 + ADX ---
     adx_5m_min  = float(getattr(S, "adx_5m_min", 25.0))
@@ -177,10 +199,10 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
     ma_up    = (ema_fast > ema_mid) and (ema_mid > ema_slow if have_slow else True)
     ma_down  = (ema_fast < ema_mid) and (ema_mid < ema_slow if have_slow else True)
 
-    adx_strong = adx >= float(getattr(S, "adx_strong_min", 25.0))
+    adx_strong = adx >= float(getattr(S, "adx_strong_min", 23.0))
     vol        = _g("volume", _g("vol", 0.0))
     vol_ma     = _g("vol_ma", _g("volume_ma", 0.0))
-    vol_exp    = (vol_ma > 0.0) and (vol > vol_ma * float(getattr(S, "volume_expand_k", 1.2)))
+    vol_exp    = (vol_ma > 0.0) and (vol > vol_ma * float(getattr(S, "volume_expand_k", 1.3)))
     bbw        = _g("bb_width", _g("bb_w", 0.0))
     bbw_ma     = _g("bb_width_ma", _g("bb_w_ma", 0.0))
     bb_expand  = (bbw_ma > 0.0) and (bbw > bbw_ma)
@@ -197,9 +219,25 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
     ctx["strong_score_up"] = strong_score_up
     ctx["strong_score_down"] = strong_score_down
 
+    # === 追加3: 急激な価格変動がある場合は強さスコアを補正 ===
+    if sudden_move:
+        # 急変時はより保守的な判定 - 既存の強さスコアに重みを追加
+        strong_score_up = min(strong_score_up + 1, 6)
+        strong_score_down = min(strong_score_down + 1, 6)
+
+    ctx["strong_score_up"] = strong_score_up
+    ctx["strong_score_down"] = strong_score_down
+
+    # === 追加4: 仮想通貨相関指標 ===
+    btc_correlation = _g("btc_correlation", 1.0)
+    if abs(btc_correlation) > 0.7:
+        # BTCと強く連動している場合、信頼度を調整
+        ctx["high_correlation"] = True
+        ctx["btc_correlation_value"] = btc_correlation
+
     # --- トレンド“ゲート”: ATR%/ADX のモード切替（OR/AND/ADX/ATR） ---
     mode     = str(getattr(S, "trend_gate_mode", "OR")).upper()
-    atr_gate = atrp >= float(getattr(S, "atrp_trend_min", 0.008))
+    atr_gate = atrp >= float(getattr(S, "atrp_trend_min", 0.012))
     adx_gate = adx  >= float(getattr(S, "adx_trend_min", 20.0))
     if mode == "AND":
         gate_trend = atr_gate and adx_gate
