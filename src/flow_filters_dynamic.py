@@ -311,6 +311,17 @@ def _is_capitulation_short(ctx: Dict[str, Any]) -> bool:
     oi_dp = float(ctx.get("oi_drop_pct", 0.0))
     return (ofi_z <= -2.0) and (liq_l >= 3_000_000.0) and (oi_dp <= -0.7)
 
+def should_allow_override(regime: str, side: str, flow_metrics: Dict) -> bool:
+    """
+    トレンド方向と一致するオーバーライドのみ許可
+    """
+    if regime == "trend_up" and side != "LONG":
+        return False
+    if regime == "trend_down" and side != "SHORT":
+        return False
+    # ニュートラルレジームでは両方向許可
+    return True
+
 
 def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) -> Tuple[bool, str]:
     price = float(ctx.get("price", 0.0))

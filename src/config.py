@@ -55,15 +55,15 @@ class StrategyConfig:
     entry_pullback_atr: float = 0.25
     entry_pullback_atr_trend_min: float = 0.35
 
-    flow_window_short_sec: int = 30
-    flow_window_long_sec: int = 60
+    flow_window_short_sec: int = 90
+    flow_window_long_sec: int = 180
     flow_min_imbalance: float = 0.25
     flow_min_count: int = 180
     flow_min_consec: int = 10
     flow_min_net_usd: float = 100000.0
 
-    pullback_override_rateS: float = 9000.0
-    pullback_override_netS: float = 80000.0
+    pullback_override_rateS: float = 12000.0
+    pullback_override_netS: float = 120000.0
 
     # --- Distance hard-cap from SMA10 ---
     entry_max_over_sma10_atr_trend: float = 1.50
