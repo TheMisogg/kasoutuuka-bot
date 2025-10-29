@@ -311,17 +311,20 @@ def _is_capitulation_short(ctx: Dict[str, Any]) -> bool:
     oi_dp = float(ctx.get("oi_drop_pct", 0.0))
     return (ofi_z <= -2.0) and (liq_l >= 3_000_000.0) and (oi_dp <= -0.7)
 
-def should_allow_override(regime: str, side: str, flow_metrics: Dict) -> bool:
+def should_allow_override(regime: str, side: str, flow_metrics: Dict | None = None) -> bool:
     """
-    トレンド方向と一致するオーバーライドのみ許可
+    レジームに応じて「強フロー等のオーバーライド」を許可するか判定。
+    - trend_up  : LONG のみ許可
+    - trend_down: SHORT のみ許可
+    - neutral / range: 両方向許可
+    flow_metrics は将来拡張用（現状未使用）。
     """
+    side = (side or "").upper()
     if regime == "trend_up" and side != "LONG":
         return False
     if regime == "trend_down" and side != "SHORT":
         return False
-    # ニュートラルレジームでは両方向許可
     return True
-
 
 def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) -> Tuple[bool, str]:
     price = float(ctx.get("price", 0.0))
@@ -340,12 +343,6 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
         return (False, f"RSI<{int(getattr(S, 'rsi_long_min', 55))}(guard)")    
 
     relax_tags = []
-    # === ブル・レジーム中は SHORT 原則禁止（例外：カピチュレーションSHORT） ===
-    if regime == "trend_up":
-        if _is_capitulation_short(ctx):
-            ctx["mode"] = "capitulation_short"  # main.py 側でサイズ/TP調整
-            return (True, "capitulation_short")
-        return (False, "Bull regime: short disabled")
 
     # --- (1) Pullback rule ---
     alpha_base = float(getattr(S, "entry_pullback_atr", 0.25))
@@ -403,9 +400,10 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
         allow_by_momentum = bool(getattr(S, "use_momentum_pullback_override", True)) \
                             and votes >= int(getattr(S, "momentum_votes_min", 2)) \
                             and (dist_atr <= (k_cap_dyn + extra))
-        if allow_by_flow:
+        regime_ok = should_allow_override(regime, "LONG", fm_s)
+        if allow_by_flow and regime_ok:
             relax_tags.append("strong_flow_override")
-        elif allow_by_momentum:
+        elif allow_by_momentum and regime_ok:
             relax_tags.append("momentum_override")
         else:
            # --- Pivot-OB override: SMA10 近辺で bid 優勢なら押し目成立とみなす ---
@@ -414,7 +412,7 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
                pivot_max_dist = float(getattr(S, "pivot_max_dist_atr", 1.20))   # 目安: ≤1.2ATR上
                want =  float(getattr(S, "pivot_ob_max_ratio", 0.75))            # ask/bid ≤ 0.75（bid優勢）
                need_z = float(getattr(S, "pivot_min_ofi_z", 1.2))               # 最低限のOFI z
-               if (dist_atr <= pivot_max_dist) and (ob_ratio <= want) and (ofi_z >= need_z) and (votes >= 2):
+               if regime_ok and (dist_atr <= pivot_max_dist) and (ob_ratio <= want) and (ofi_z >= need_z) and (votes >= 2):
                    relax_tags.append("pivot_ob_override")
                else:
                     why = f"押し目待ち: ≤SMA10+{alpha:.2f}ATR (now +{dist_atr:.2f}ATR)"
@@ -439,7 +437,8 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
             # allow override by strong flow
             rateS_th = float(getattr(S, "ob_override_rateS", 6000.0))
             netS_th  = float(getattr(S, "ob_override_netS", 50000.0))
-            if (fm_s.get("rate_usd",0.0) >= rateS_th) and (fm_s.get("net_usd",0.0) >= netS_th):
+            if (fm_s.get("rate_usd",0.0) >= rateS_th) and (fm_s.get("net_usd",0.0) >= netS_th) \
+               and should_allow_override(regime, "LONG", fm_s):
                 relax_tags.append("ob_strong_flow_override")
             else:
                 return (False, f"OB警戒: {ob_ratio:.2f} (max {base_max:.2f}+{relax:.2f}) | flow弱 (rateS={int(fm_s.get('rate_usd',0))}/s netS={int(fm_s.get('net_usd',0))})")
@@ -548,9 +547,10 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
         allow_by_momentum = bool(getattr(S, "use_momentum_pullback_override", True)) \
                             and votes >= int(getattr(S, "momentum_votes_min", 2)) \
                             and (dist_atr <= (k_cap_dyn + extra))
-        if allow_by_flow:
+        regime_ok = should_allow_override(regime, "SHORT", fm_s)
+        if allow_by_flow and regime_ok:
             relax_tags.append("strong_flow_override")
-        elif allow_by_momentum:
+        elif allow_by_momentum and regime_ok:
             relax_tags.append("momentum_override")
         else:
             # --- Pivot-OB override: SMA10近辺で ask 優勢（頭上の売り板）なら戻り売り成立 ---
@@ -559,7 +559,7 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
                 pivot_max_dist = float(getattr(S, "pivot_max_dist_atr", 1.20))   # 目安: ≤1.2ATR下
                 want_min = 1.0 / max(1e-9, float(getattr(S, "pivot_ob_max_ratio", 0.75)))  # ask/bid ≥ 1/(0.75)=1.33...
                 need_z   = float(getattr(S, "pivot_min_ofi_z", 1.2))
-                if (dist_atr <= pivot_max_dist) and (ob_ratio >= want_min) and (ofi_z <= -need_z) and (votes >= 2):
+                if regime_ok and (dist_atr <= pivot_max_dist) and (ob_ratio >= want_min) and (ofi_z <= -need_z) and (votes >= 2):
                     relax_tags.append("pivot_ob_override")
                 else:
                     why = f"戻り売り待ち: ≥SMA10-{alpha:.2f}ATR (now -{dist_atr:.2f}ATR)"
@@ -586,7 +586,8 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
             # 強い売りフローで上書き
             rateS_th = float(getattr(S, "ob_override_rateS", 6000.0))
             netS_th  = float(getattr(S, "ob_override_netS", 50000.0))
-            if (abs(fm_s.get("rate_usd",0.0)) >= rateS_th) and (fm_s.get("net_usd",0.0) <= -netS_th):
+            if (abs(fm_s.get("rate_usd",0.0)) >= rateS_th) and (fm_s.get("net_usd",0.0) <= -netS_th) \
+               and should_allow_override(regime, "SHORT", fm_s):
                 relax_tags.append("ob_strong_flow_override")
             else:
                 base_min_show = (1.0 / base_max) if base_max > 0 else float("inf")
