@@ -255,6 +255,20 @@ class StrategyConfig:
     # SHORT側のRSI上限（推奨 50）
     rsi_short_max: float = 30.0
 
+    
+    # --- Micro pullback entry（1分/OBで押し目・戻りを待ってから入る） ---
+    # 有効化すると、ガード通過直後に “ターゲット価格を待ってから” 以降の発注ロジックを実行します。
+    use_micro_pullback_entry: bool = True
+    micro_max_wait_sec: int = 30                 # 最大待機秒（未到達ならスキップ）
+    micro_improve_bps: float = 5.0               # 現値より最低でもこれだけ有利に（100bps=1%）
+    micro_sr_buffer_bps: float = 2.0             # S/Rを少し内側に寄せる
+    micro_sr_lookback_5m: int = 96               # 5分足のS/R算出に使う本数
+    micro_use_1m_confirm: bool = True            # 1分EMA/ATRを使って押し目位置を補強
+    micro_ema_len_1m: int = 21
+    micro_atr_len_1m: int = 14
+    micro_pullback_k_atr: float = 0.8            # 1分EMA ± k*ATR を候補に採用
+    micro_invalidation_extra_bps: float = 2.0    # S/R割れ判定の余裕
+
 APP = AppConfig()
 API = ApiConfig()
 STRATEGY = StrategyConfig()

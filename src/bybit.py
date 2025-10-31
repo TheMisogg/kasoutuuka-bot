@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os, time, hmac, hashlib, json, urllib.request
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
+import math
 from urllib.parse import urlencode
 from .config import API
 
@@ -162,7 +163,136 @@ def get_balance() -> float:
     a, _ = get_usdt_available_and_equity()
     return a
 
+# === Added: price tick filters ===
+def _get_price_filters(symbol: str) -> Tuple[float, float]:
+    """
+    tickSize と minPrice を返す（/v5/market/instruments-info）
+    失敗時は安全側の既定値 (tick=0.01, minPrice=0.0) を返します。
+    """
+    try:
+        res = _public_get("/v5/market/instruments-info", {"category": "linear", "symbol": symbol})
+        if res.get("retCode") != 0:
+            return 0.01, 0.0
+        info = (res.get("result") or {}).get("list") or []
+        if not info:
+            return 0.01, 0.0
+        pf = (info[0].get("priceFilter") or {})
+        tick = float(pf.get("tickSize", 0.01))
+        minp = float(pf.get("minPrice", 0.0))
+        return tick, minp
+    except Exception:
+        return 0.01, 0.0
 
+def _normalize_side(side: str) -> str:
+    """'LONG'/'SHORT' 等を Bybit API の 'Buy'/'Sell' に正規化"""
+    s = (side or "").strip().lower()
+    if s in ("buy", "long"):
+        return "Buy"
+    if s in ("sell", "short"):
+        return "Sell"
+    return "Buy"
+
+def _round_price_for_side(price: float, tick: float, side: str) -> float:
+    """
+    価格丸め。Buy は tick 切り捨て、Sell は tick 切り上げ（クロスしづらくする）
+    """
+    if tick <= 0:
+        return float(price)
+    q = float(price) / float(tick)
+    if _normalize_side(side) == "Buy":
+        return float(int(q) * float(tick))
+    else:
+        return float(math.ceil(q) * float(tick))
+
+# === Added: limit / post-only limit ===
+def place_linear_limit_order(
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    *,
+    post_only: bool = False,
+    tif: str = "GTC",
+    reduce_only: bool = False,
+) -> Dict[str, Any]:
+    """
+    Bybit v5 /order/create での指値。qty/price を取引所フィルタで補正。
+    post_only=True の場合は timeInForce を 'PostOnly' に上書きします。
+    """
+    side_n = _normalize_side(side)
+    qty_step, min_qty = _get_qty_filters(symbol)
+    tick, _minp = _get_price_filters(symbol)
+
+    # qty/price 補正
+    adj_qty = max(qty, min_qty)
+    adj_qty = _round_step(adj_qty, qty_step)
+    adj_price = _round_price_for_side(float(price), tick, side_n)
+
+    tif_final = "PostOnly" if post_only else (tif or "GTC")
+    body = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": side_n,                 # "Buy" / "Sell"
+        "orderType": "Limit",
+        "qty": str(adj_qty),
+        "price": str(adj_price),
+        "reduceOnly": bool(reduce_only),
+        "timeInForce": tif_final,       # "GTC" / "IOC" / "FOK" / "PostOnly"
+    }
+    return _private_post("/v5/order/create", body)
+
+def place_linear_postonly_limit(
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    *,
+    reduce_only: bool = False,
+) -> Dict[str, Any]:
+    """PostOnly 専用ヘルパ（timeInForce='PostOnly' 固定）"""
+    return place_linear_limit_order(
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        price=price,
+        post_only=True,
+        tif="PostOnly",
+        reduce_only=reduce_only,
+    )
+
+# === Added: cancel single order ===
+def cancel_order(symbol: str, order_id: str) -> Dict[str, Any]:
+    """単発キャンセル（/v5/order/cancel）"""
+    body = {"category": "linear", "symbol": symbol, "orderId": order_id}
+    return _private_post("/v5/order/cancel", body)
+
+def get_order_realtime(symbol: str, order_id: str) -> Dict[str, Any]:
+    """
+    注文の現在状態（/v5/order/realtime）
+    Filled / PartiallyFilled / New / Cancelled / Rejected など
+    """
+    params = {"category": "linear", "symbol": symbol, "orderId": order_id}
+    return _private_get("/v5/order/realtime", params)
+
+def get_executions_by_order(symbol: str, order_id: str, start: Optional[int] = None) -> Dict[str, Any]:
+    """
+    約定履歴（/v5/execution/list）
+    平均価格が取れない場合の再集計に利用
+    """
+    params = {"category": "linear", "symbol": symbol, "orderId": order_id}
+    if start is not None:
+        params["startTime"] = str(int(start))
+    return _private_get("/v5/execution/list", params)
+
+def get_executions_by_order(symbol: str, order_id: str, start: Optional[int] = None) -> Dict[str, Any]:
+    """
+    約定履歴（/v5/execution/list）
+    平均価格が取れない場合の再集計に利用
+    """
+    params = {"category": "linear", "symbol": symbol, "orderId": order_id}
+    if start is not None:
+        params["startTime"] = str(int(start))
+    return _private_get("/v5/execution/list", params)
 # ==== Added by patch: safe reduce-only helpers ====
 
 from typing import Optional, Dict, Any, List

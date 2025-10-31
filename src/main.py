@@ -38,6 +38,8 @@ from .flow_filters_dynamic import (
     is_exhaustion_long,
 )
 
+from .micro_entry import compute_pullback_target, wait_for_micro_entry
+
 # ===== bybit.py の関数名差異に自動対応（get_klines_linearが無くてもOK）=====
 from typing import Optional
 try:
@@ -910,6 +912,10 @@ def run_loop():
     state = state or {}
     
     # === ニュートラル取引カウントのリセット処理 ===
+    # ===== 追加①: bybit関数の参照を上の初期化ブロックに追記 =====
+    _get_order_rt_fn   = getattr(_bx, "get_order_realtime", None) if _bx else None
+    _get_execs_fn      = getattr(_bx, "get_executions_by_order", None) if _bx else None
+    _cancel_order_fn   = getattr(_bx, "cancel_order", None) if _bx else None
     # 状態初期化時に追加
     if "last_neutral_reset" not in state:
         state["last_neutral_reset"] = datetime.utcnow().isoformat()
@@ -1553,6 +1559,87 @@ def run_loop():
                 time.sleep(float(S.poll_interval_sec))
                 continue
 
+            # --- Micro pullback entry（オプション）---
+            # 5分確定後すぐ飛びつかず、1分/OBを使って“より良い価格”を待つ。
+            # 到達したら c を最新に置換し、そのまま既存の数量・TP/SL算出と発注フローへ進む。
+            if bool(getattr(S, "use_micro_pullback_entry", False)):
+                from .micro_entry import compute_pullback_target, wait_for_micro_entry
+                def _now_price_mid():
+                    try:
+                        ob2 = fetch_orderbook_linear(S.symbol, _DEF_OB_DEPTH)
+                        if isinstance(ob2, dict) and "result" in ob2:
+                            bids = [(float(p), float(q)) for p, q in ob2["result"].get("b", [])]
+                            asks = [(float(p), float(q)) for p, q in ob2["result"].get("a", [])]
+                        else:
+                            bids = ob2.get("bids", [])
+                            asks = ob2.get("asks", [])
+                        bp = float(bids[0][0]) if bids else c
+                        ap = float(asks[0][0]) if asks else c
+                        return (bp + ap) / 2.0
+                    except Exception:
+                        return c
+                def _get_1m_ema_atr():
+                    try:
+                        rows1m = get_klines_any(S.symbol, 1, 120)
+                        closes1 = [r["close"] for r in rows1m]
+                        highs1  = [r["high"]  for r in rows1m]
+                        lows1   = [r["low"]   for r in rows1m]
+                        ser = pd.Series(closes1)
+                        ema1 = float(ser.ewm(span=int(getattr(S, "micro_ema_len_1m", 21)), adjust=False).mean().iloc[-1])
+                        atr1 = float(atr(highs1, lows1, closes1, int(getattr(S, "micro_atr_len_1m", 14)))[-1])
+                        return ema1, atr1
+                    except Exception:
+                        return None, None
+                last5m = {"high": ind["high"], "low": ind["low"], "close": ind["close"]}
+                target, sr_lo, sr_hi, target_note = compute_pullback_target(
+                    side=side_for_entry,
+                    now_price=_now_price_mid(),
+                    last5m=last5m,
+                    use_1m=bool(getattr(S, "micro_use_1m_confirm", True)),
+                    get_1m_ema_atr=_get_1m_ema_atr,
+                    sr_lookback=int(getattr(S, "micro_sr_lookback_5m", 96)),
+                    sr_buffer_bps=float(getattr(S, "micro_sr_buffer_bps", 2.0)),
+                    pullback_k_atr=float(getattr(S, "micro_pullback_k_atr", 0.8)),
+                    improve_bps=float(getattr(S, "micro_improve_bps", 5.0)),
+                )
+                # --- ログ: 指値(待ち)開始を明示 ---
+                _srlo = f"{sr_lo:.4f}" if sr_lo is not None else "None"
+                _srhi = f"{sr_hi:.4f}" if sr_hi is not None else "None"
+                try:
+                    notify_slack(
+                        f"🧱 micro-entry: 待機開始 side={side_for_entry} "
+                        f"target={target:.4f} | SR[{_srlo},{_srhi}] | {target_note}"
+                    )
+                except Exception:
+                    pass
+                ok_wait, exec_px, wait_note = wait_for_micro_entry(
+                    side=side_for_entry,
+                    target=target,
+                    get_now_price=_now_price_mid,
+                    sr_low=sr_lo,
+                    sr_high=sr_hi,
+                    invalidation_extra_bps=float(getattr(S, "micro_invalidation_extra_bps", 2.0)),
+                    max_wait_sec=int(getattr(S, "micro_max_wait_sec", 30)),
+                )
+                if not ok_wait:
+                    _bump_skip(state, "other")
+                    notify_slack(f"ℹ️ スキップ: micro-entry未充足 {wait_note} | target={target:.4f} ({target_note})")
+                    last_handled_kline = last_start
+                    state['last_kline_start'] = last_start
+                    save_state(state)
+                    time.sleep(float(S.poll_interval_sec))
+                    continue
+                # --- ログ: micro-entry 約定（=到達） ---
+                try:
+                    notify_slack(
+                        f"🎯 micro-entry: 約定 side={side_for_entry} exec@{float(exec_px):.4f} | {wait_note}"
+                    )
+                except Exception:
+                    pass
+                # ここで“実勢の価格”に置換して、以降の枚数・TP/SL算出へ進む
+                c = float(exec_px)
+                relax_note = (relax_note + " | " if relax_note else " | ") + f"micro_entry@{c:.4f}"
+                
             # --- 発注可否・数量計算 ---
             if len(state["positions"]) >= int(S.max_positions):
                 _bump_skip(state, "max_positions")
@@ -1624,10 +1711,147 @@ def run_loop():
                     else:
                         limit_px = max(c, s10 - pull)
                         open_side = "Sell"
+
                     res = _place_postonly_fn(S.symbol, open_side, qty, limit_px)
                     if isinstance(res, dict) and res.get("retCode") == 0:
                         placed_postonly = True
-                        notify_slack(f"🧱 PostOnly指値: {limit_px:.4f} | Qty {qty:.4f}")
+                        try:
+                            oid = (res.get("result") or {}).get("orderId") or (res.get("result") or {}).get("order_id") or ""
+                        except Exception:
+                            oid = ""
+                        notify_slack(f"🧱 指値配置(PostOnly): {open_side} {limit_px:.4f} | Qty {qty:.4f}" + (f" | id={oid}" if oid else ""))
+
+                        # === 約定監視 ===
+                        fill_timeout = int(getattr(S, "postonly_fill_timeout_sec", 120))
+                        poll_iv      = float(getattr(S, "postonly_poll_interval_sec", 0.5))
+                        allow_part   = bool(getattr(S, "postonly_allow_partial", True))
+                        min_ratio    = float(getattr(S, "postonly_min_fill_ratio", 0.5))
+                        cancel_to    = bool(getattr(S, "postonly_cancel_on_timeout", True))
+                        cancel_rem   = bool(getattr(S, "postonly_cancel_remainder_on_partial", True))
+
+                        t0 = time.time()
+                        filled_qty = 0.0
+                        avg_fill_px = 0.0
+                        last_note_ts = 0.0
+
+                        while True:
+                            time.sleep(poll_iv)
+
+                            # 1) 注文状態（Filled/PartiallyFilled など）
+                            ord_data = _get_order_rt_fn(S.symbol, oid) if (_get_order_rt_fn and oid) else None
+                            items = []
+                            if isinstance(ord_data, dict):
+                                try:
+                                    items = (ord_data.get("result") or {}).get("list") or []
+                                except Exception:
+                                    items = []
+                            od = items[0] if items else {}
+                            status = str(od.get("orderStatus", "")) if od else ""
+
+                            try:
+                                filled_qty = float(od.get("cumExecQty", od.get("cumQty", 0.0)) or 0.0)
+                            except Exception:
+                                filled_qty = 0.0
+                            try:
+                                avg_fill_px = float(od.get("avgPrice", 0.0) or 0.0)
+                            except Exception:
+                                avg_fill_px = 0.0
+
+                            # 2) 平均約定が空なら、実約定で再集計
+                            if filled_qty > 0 and avg_fill_px <= 0 and _get_execs_fn and oid:
+                                ex = _get_execs_fn(S.symbol, oid)
+                                lst = []
+                                try:
+                                    lst = (ex.get("result") or {}).get("list") or []
+                                except Exception:
+                                    lst = []
+                                if lst:
+                                    _sum_px_qty = 0.0
+                                    _sum_qty = 0.0
+                                    for e in lst:
+                                        try:
+                                            q = float(e.get("execQty", 0.0))
+                                            p = float(e.get("execPrice", 0.0))
+                                        except Exception:
+                                            q = 0.0; p = 0.0
+                                        _sum_px_qty += p * q
+                                        _sum_qty    += q
+                                    if _sum_qty > 0:
+                                        avg_fill_px = _sum_px_qty / _sum_qty
+                                        filled_qty  = _sum_qty
+
+                            full  = filled_qty >= float(qty) * 0.999
+                            ratio = (filled_qty / float(qty)) if float(qty) > 0 else 0.0
+                            now   = time.time()
+
+                            # 途中経過ログ（10秒に1回）
+                            if now - last_note_ts > 10.0:
+                                last_note_ts = now
+                                notify_slack(f"⏳ PostOnly監視: status={status or 'N/A'} fill={filled_qty:.4f}/{qty:.4f} avg={avg_fill_px or 0.0:.4f}")
+
+                            # 充足 → state 反映
+                            if filled_qty > 0 and (full or (allow_part and ratio >= min_ratio)):
+                                sz = float(filled_qty)
+                                if (not full) and cancel_rem and _cancel_order_fn and oid:
+                                    try:
+                                        _cancel_order_fn(S.symbol, oid)
+                                    except Exception:
+                                        pass
+
+                                # ここから通常エントリー相当の登録
+                                c_exec = float(avg_fill_px) if avg_fill_px > 0 else c
+                                notional = sz * c_exec
+                                fee_rate = float(getattr(S, "maker_fee_rate", getattr(S, "taker_fee_rate", 0.0007)))
+                                buy_fee  = notional * fee_rate
+
+                                pos = {
+                                    "side": "long" if side == "LONG" else "short",
+                                    "entry_price": c_exec,
+                                    "qty": sz,
+                                    "buy_fee": buy_fee,
+                                    "tp_price": tp_price,
+                                    "sl_price": sl_price,
+                                    "time": datetime.utcnow().isoformat(),
+                                    "be_k":  float(prof.get("be_k", 0.0)),
+                                    "trail_k": float(prof.get("trail_k", 0.0)),
+                                    "profile": str(prof.get("name","")),
+                                    "flip": bool(_overrides.get("force_flip", False)),
+                                    "risk_sl_dist": abs(c_exec - sl_price),  # ← ここを c ではなく c_exec で
+                                }
+                                try:
+                                    _on_new_entry(state, is_flip=bool(_overrides.get("force_flip")) if '_overrides' in locals() else False)
+                                except Exception:
+                                    pass
+                                state["positions"].append(pos)
+                                state["last_entry_time"] = datetime.utcnow().isoformat()
+
+                                prof_name = str(prof.get("name",""))
+                                if full:
+                                    notify_slack(f"💰 エントリー({side})[PostOnly約定全量]: {c_exec:.4f} | TP {tp_price:.4f} | SL {sl_price:.4f} | Qty {sz:.4f} | 管理={prof_name}{relax_note}")
+                                else:
+                                    notify_slack(f"💰 エントリー({side})[PostOnly部分約定 {ratio*100:.0f}%]: {c_exec:.4f} | TP {tp_price:.4f} | SL {sl_price:.4f} | Qty {sz:.4f} | 管理={prof_name}{relax_note}")
+
+                                last_handled_kline = last_start
+                                state["last_kline_start"] = last_start
+                                save_state(state)
+                                time.sleep(float(S.poll_interval_sec))
+                                break
+
+                            # タイムアウト
+                            if (now - t0) > float(fill_timeout):
+                                if cancel_to and _cancel_order_fn and oid:
+                                    try:
+                                        _cancel_order_fn(S.symbol, oid)
+                                        notify_slack(f"🧹 PostOnlyキャンセル（timeout {fill_timeout}s） id={oid}")
+                                    except Exception as e:
+                                        notify_slack(f":x: PostOnlyキャンセル失敗: {e}")
+                                _bump_skip(state, "other")
+                                notify_slack(f"ℹ️ スキップ: PostOnly未充足 timeout（fill={filled_qty:.4f}/{qty:.4f}）")
+                                last_handled_kline = last_start
+                                state['last_kline_start'] = last_start
+                                save_state(state)
+                                time.sleep(float(S.poll_interval_sec))
+                                break
                     else:
                         notify_slack(f":x: PostOnly発注失敗: {res}")
             except Exception as e:
@@ -1731,6 +1955,7 @@ def run_loop():
                                 "be_k":  float(prof.get("be_k", 0.0)),
                                 "trail_k": float(prof.get("trail_k", 0.0)),
                                 "profile": str(prof.get("name","")),
+                                "risk_sl_dist": abs(c - sl_price),   # ← 追加（成行/簡易APIは c が建値）
                             }
                             _on_new_entry(state, is_flip=bool(_overrides.get("force_flip")) if '_overrides' in locals() else False)
                             state["positions"].append(pos)
