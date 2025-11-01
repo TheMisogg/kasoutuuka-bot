@@ -1559,86 +1559,7 @@ def run_loop():
                 time.sleep(float(S.poll_interval_sec))
                 continue
 
-            # --- Micro pullback entry（オプション）---
-            # 5分確定後すぐ飛びつかず、1分/OBを使って“より良い価格”を待つ。
-            # 到達したら c を最新に置換し、そのまま既存の数量・TP/SL算出と発注フローへ進む。
-            if bool(getattr(S, "use_micro_pullback_entry", False)):
-                from .micro_entry import compute_pullback_target, wait_for_micro_entry
-                def _now_price_mid():
-                    try:
-                        ob2 = fetch_orderbook_linear(S.symbol, _DEF_OB_DEPTH)
-                        if isinstance(ob2, dict) and "result" in ob2:
-                            bids = [(float(p), float(q)) for p, q in ob2["result"].get("b", [])]
-                            asks = [(float(p), float(q)) for p, q in ob2["result"].get("a", [])]
-                        else:
-                            bids = ob2.get("bids", [])
-                            asks = ob2.get("asks", [])
-                        bp = float(bids[0][0]) if bids else c
-                        ap = float(asks[0][0]) if asks else c
-                        return (bp + ap) / 2.0
-                    except Exception:
-                        return c
-                def _get_1m_ema_atr():
-                    try:
-                        rows1m = get_klines_any(S.symbol, 1, 120)
-                        closes1 = [r["close"] for r in rows1m]
-                        highs1  = [r["high"]  for r in rows1m]
-                        lows1   = [r["low"]   for r in rows1m]
-                        ser = pd.Series(closes1)
-                        ema1 = float(ser.ewm(span=int(getattr(S, "micro_ema_len_1m", 21)), adjust=False).mean().iloc[-1])
-                        atr1 = float(atr(highs1, lows1, closes1, int(getattr(S, "micro_atr_len_1m", 14)))[-1])
-                        return ema1, atr1
-                    except Exception:
-                        return None, None
-                last5m = {"high": ind["high"], "low": ind["low"], "close": ind["close"]}
-                target, sr_lo, sr_hi, target_note = compute_pullback_target(
-                    side=side_for_entry,
-                    now_price=_now_price_mid(),
-                    last5m=last5m,
-                    use_1m=bool(getattr(S, "micro_use_1m_confirm", True)),
-                    get_1m_ema_atr=_get_1m_ema_atr,
-                    sr_lookback=int(getattr(S, "micro_sr_lookback_5m", 96)),
-                    sr_buffer_bps=float(getattr(S, "micro_sr_buffer_bps", 2.0)),
-                    pullback_k_atr=float(getattr(S, "micro_pullback_k_atr", 0.8)),
-                    improve_bps=float(getattr(S, "micro_improve_bps", 5.0)),
-                )
-                # --- ログ: 指値(待ち)開始を明示 ---
-                _srlo = f"{sr_lo:.4f}" if sr_lo is not None else "None"
-                _srhi = f"{sr_hi:.4f}" if sr_hi is not None else "None"
-                try:
-                    notify_slack(
-                        f"🧱 micro-entry: 待機開始 side={side_for_entry} "
-                        f"target={target:.4f} | SR[{_srlo},{_srhi}] | {target_note}"
-                    )
-                except Exception:
-                    pass
-                ok_wait, exec_px, wait_note = wait_for_micro_entry(
-                    side=side_for_entry,
-                    target=target,
-                    get_now_price=_now_price_mid,
-                    sr_low=sr_lo,
-                    sr_high=sr_hi,
-                    invalidation_extra_bps=float(getattr(S, "micro_invalidation_extra_bps", 2.0)),
-                    max_wait_sec=int(getattr(S, "micro_max_wait_sec", 30)),
-                )
-                if not ok_wait:
-                    _bump_skip(state, "other")
-                    notify_slack(f"ℹ️ スキップ: micro-entry未充足 {wait_note} | target={target:.4f} ({target_note})")
-                    last_handled_kline = last_start
-                    state['last_kline_start'] = last_start
-                    save_state(state)
-                    time.sleep(float(S.poll_interval_sec))
-                    continue
-                # --- ログ: micro-entry 約定（=到達） ---
-                try:
-                    notify_slack(
-                        f"🎯 micro-entry: 約定 side={side_for_entry} exec@{float(exec_px):.4f} | {wait_note}"
-                    )
-                except Exception:
-                    pass
-                # ここで“実勢の価格”に置換して、以降の枚数・TP/SL算出へ進む
-                c = float(exec_px)
-                relax_note = (relax_note + " | " if relax_note else " | ") + f"micro_entry@{c:.4f}"
+            # micro-entry を使わない（一本化）
                 
             # --- 発注可否・数量計算 ---
             if len(state["positions"]) >= int(S.max_positions):
@@ -1705,11 +1626,20 @@ def run_loop():
                         except Exception:
                             pass
                     pull = float(getattr(S, "entry_pullback_atr", 0.25)) * a
+                    # 5分シグナル直後に板へ PostOnly 指値を即配置
                     if side == "LONG":
-                        limit_px = min(c, s10 + pull)
+                        try:
+                            best_bid = float(book["bids"][0][0])
+                        except Exception:
+                            best_bid = c
+                        limit_px = min(best_bid, s10 + pull)
                         open_side = "Buy"
                     else:
-                        limit_px = max(c, s10 - pull)
+                        try:
+                            best_ask = float(book["asks"][0][0])
+                        except Exception:
+                            best_ask = c
+                        limit_px = max(best_ask, s10 - pull)
                         open_side = "Sell"
 
                     res = _place_postonly_fn(S.symbol, open_side, qty, limit_px)

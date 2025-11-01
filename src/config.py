@@ -258,7 +258,7 @@ class StrategyConfig:
     
     # --- Micro pullback entry（1分/OBで押し目・戻りを待ってから入る） ---
     # 有効化すると、ガード通過直後に “ターゲット価格を待ってから” 以降の発注ロジックを実行します。
-    use_micro_pullback_entry: bool = True
+    use_micro_pullback_entry: bool = False
     micro_max_wait_sec: int = 30                 # 最大待機秒（未到達ならスキップ）
     micro_improve_bps: float = 5.0               # 現値より最低でもこれだけ有利に（100bps=1%）
     micro_sr_buffer_bps: float = 2.0             # S/Rを少し内側に寄せる
@@ -269,6 +269,13 @@ class StrategyConfig:
     micro_pullback_k_atr: float = 0.8            # 1分EMA ± k*ATR を候補に採用
     micro_invalidation_extra_bps: float = 2.0    # S/R割れ判定の余裕
 
+    # --- PostOnly 監視の明示設定（未設定でも main.py の getattr 既定値で動作）---
+    postonly_fill_timeout_sec: int = 180
+    postonly_poll_interval_sec: float = 0.5
+    postonly_allow_partial: bool = True
+    postonly_min_fill_ratio: float = 0.25
+    postonly_cancel_on_timeout: bool = True
+    postonly_cancel_remainder_on_partial: bool = True
 APP = AppConfig()
 API = ApiConfig()
 STRATEGY = StrategyConfig()
