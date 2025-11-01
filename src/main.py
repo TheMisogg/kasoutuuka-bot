@@ -1440,6 +1440,8 @@ def run_loop():
             })
 
             # --- エントリーガード判定（必ず ok/why を定義する）---
+            # Regime を先に決定して ctx へ格納（ログと以降の判定で同一値を使う）
+            ctx["regime"] = classify_regime(ctx)
             ok: bool = False
             why: str = "guard not evaluated"
 
@@ -1458,6 +1460,18 @@ def run_loop():
                 why = f"guard-eval exception: {e!s}"
                 notify_slack(f":x: 例外: {why}")
 
+            # ガード結果を“必ず”反映（これが無いと NG でも先へ進む）
+            if not ok:
+                _bump_skip(state, "guard_ng")
+                notify_slack(f"ℹ️ スキップ: エントリーガード不成立 ({why})")
+                last_handled_kline = last_start
+                state['last_kline_start'] = last_start
+                save_state(state)
+                time.sleep(float(S.poll_interval_sec))
+                continue
+
+            # 強化チェック等で方向を参照できるよう明示
+            ctx["side_for_entry"] = side_for_entry
                         # 強化されたエントリー条件チェック
             enhanced_ok, enhanced_reason = check_enhanced_entry_conditions(ctx, ind, S)
             if not enhanced_ok:
@@ -1469,8 +1483,27 @@ def run_loop():
                 time.sleep(float(S.poll_interval_sec))
                 continue
 
-            # レジーム別取引制限
-            regime = classify_regime(ctx)
+           # レジーム別取引制限
+            regime = ctx.get("regime") or classify_regime(ctx)
+
+            # 逆張り禁止（ハードルール）
+            if not bool(getattr(S, "allow_countertrend", False)):
+                if regime == "trend_down" and side_for_entry == "LONG":
+                    _bump_skip(state, "regime_not_ok")
+                    notify_slack("ℹ️ スキップ: trend_down中のLONG禁止（逆張り抑制）")
+                    last_handled_kline = last_start
+                    state['last_kline_start'] = last_start
+                    save_state(state)
+                    time.sleep(float(S.poll_interval_sec))
+                    continue
+                if regime == "trend_up" and side_for_entry == "SHORT":
+                    _bump_skip(state, "regime_not_ok")
+                    notify_slack("ℹ️ スキップ: trend_up中のSHORT禁止（逆張り抑制）")
+                    last_handled_kline = last_start
+                    state['last_kline_start'] = last_start
+                    save_state(state)
+                    time.sleep(float(S.poll_interval_sec))
+                    continue
             if regime == "neutral":
                 # ニュートラルレジームでの取引頻度制限
                 neutral_trade_count = state.get("neutral_trade_count", 0)
@@ -1496,6 +1529,31 @@ def run_loop():
             ofi_local  = float(ctx.get("ofi_z", ofi_z if "ofi_z" in locals() else 0.0))
             strong_up   = (regime == "trend_up")   and ( (edge_votes >= need_votes and ofi_local >=  need_ofi_z) or (mtf_align == "up")   or (score_up   >= score_min) )
             strong_down = (regime == "trend_down") and ( (edge_votes >= need_votes and ofi_local <= -need_ofi_z) or (mtf_align == "down") or (score_down >= score_min) )
+            # --- PB flip-follow（cooldown_override がトレンド逆向きに出たら、順張り側へ指値を置く）---
+            pb_flip_follow = False
+            try:
+                if bool(getattr(S, "pb_flip_follow_enable", True)) and override_ok:
+                    trend_dir = "LONG" if regime == "trend_up" else ("SHORT" if regime == "trend_down" else None)
+                    override_dir = "LONG" if float(ofi_local) >= 0.0 else "SHORT"
+                    if trend_dir and (override_dir != trend_dir):
+                        # 逆方向のoverride → 順方向に切替し、改めてガードを評価
+                        if side_for_entry != trend_dir:
+                            try:
+                                if trend_dir == "LONG":
+                                    ok, why = decide_entry_guard_long(tlist, book, ctx, S)
+                                else:
+                                    ok, why = decide_entry_guard_short(tlist, book, ctx, S)
+                            except Exception as e:
+                                ok, why = False, f"guard-eval exception(pb_flip_follow): {e!s}"
+                        side_for_entry = trend_dir
+                        pb_flip_follow = True
+                        relax_note = (relax_note + " | " if relax_note else " | ") + f"pb_flip_follow({regime}: CD={override_dir}→{trend_dir})"
+                        try:
+                            notify_slack(f"🔁 pb_flip_follow: {regime} + CD-override {override_dir} → {trend_dir}（指値準備）")
+                        except Exception:
+                            pass
+            except Exception:
+                pb_flip_follow = False
 
             # レジーム別戦略最適化
             if regime == "range":
@@ -1625,21 +1683,34 @@ def run_loop():
                             _cancel_all_fn(S.symbol)
                         except Exception:
                             pass
-                    pull = float(getattr(S, "entry_pullback_atr", 0.25)) * a
+                    # pb_flip_follow の時は専用の k で「現値から有利側へ引く」価格に置く
+                    if 'pb_flip_follow' in locals() and pb_flip_follow:
+                        _k = float(getattr(S, "pb_flip_pull_atr", getattr(S, "entry_pullback_atr", 0.25)))
+                    else:
+                        _k = float(getattr(S, "entry_pullback_atr", 0.25))
+                    pull = _k * a
                     # 5分シグナル直後に板へ PostOnly 指値を即配置
                     if side == "LONG":
                         try:
                             best_bid = float(book["bids"][0][0])
                         except Exception:
                             best_bid = c
-                        limit_px = min(best_bid, s10 + pull)
+                        if 'pb_flip_follow' in locals() and pb_flip_follow:
+                            # 押し目拾い：現値より下で待つ
+                            limit_px = min(best_bid, c - pull)
+                        else:
+                            limit_px = min(best_bid, s10 + pull)
                         open_side = "Buy"
                     else:
                         try:
                             best_ask = float(book["asks"][0][0])
                         except Exception:
                             best_ask = c
-                        limit_px = max(best_ask, s10 - pull)
+                        if 'pb_flip_follow' in locals() and pb_flip_follow:
+                            # 戻り売り：現値より上で待つ
+                            limit_px = max(best_ask, c + pull)
+                        else:
+                            limit_px = max(best_ask, s10 - pull)
                         open_side = "Sell"
 
                     res = _place_postonly_fn(S.symbol, open_side, qty, limit_px)

@@ -54,6 +54,10 @@ class StrategyConfig:
     # --- Pullback ---
     entry_pullback_atr: float = 0.25
     entry_pullback_atr_trend_min: float = 0.35
+    # --- PB flip-follow（逆方向CD-overrideを押し目/戻りの合図として順張り側に指値を置く）---
+    pb_flip_follow_enable: bool = True
+    pb_flip_pull_atr: float = 0.30      # 指値の引き幅（ATR×k）
+    
 
     flow_window_short_sec: int = 90
     flow_window_long_sec: int = 180
@@ -276,6 +280,9 @@ class StrategyConfig:
     postonly_min_fill_ratio: float = 0.25
     postonly_cancel_on_timeout: bool = True
     postonly_cancel_remainder_on_partial: bool = True
+
+    # 逆張りを許可するか（デフォルト：禁止）
+    allow_countertrend: bool = False
 APP = AppConfig()
 API = ApiConfig()
 STRATEGY = StrategyConfig()
