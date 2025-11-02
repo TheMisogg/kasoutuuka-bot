@@ -232,8 +232,8 @@ class StrategyConfig:
     use_postonly_entries = True
 
         # RSI conditionsS
-    rsi_oversold: float = 30.0
-    rsi_overbought: float = 70.0
+    rsi_oversold: float = 40.0
+    rsi_overbought: float = 60.0
 
     # Multi-timeframe trend
     use_1h_trend: bool = True
