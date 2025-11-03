@@ -255,10 +255,27 @@ class StrategyConfig:
     # SHORT：close < SMA10 を必須にする
     require_close_lt_sma10_short: bool = True
     # LONG側のRSI下限（推奨 55）
-    rsi_long_min: float = 57.0
+    rsi_long_min: float = 60.0
     # SHORT側のRSI上限（推奨 50）
-    rsi_short_max: float = 48.0
+    rsi_short_max: float = 40.0
 
+    # === Guard 緩和・代替指標・動的バッファ ======================
+    # ガードで参照する移動平均（SMA10|SMA20|EMA10）。未提供ならSMA10にフォールバック
+    guard_ma_type: str = "SMA10"
+    # ATRバッファ（k * ATR）。“0.10”で ±0.1*ATR の許容帯を与える
+    guard_buffer_atr_base: float = 0.10
+    # レジーム別倍率（neutralは厳しめ＝小さく、trendは標準、rangeはやや厳しめ）
+    guard_buffer_mul_trend: float = 1.00
+    guard_buffer_mul_neutral: float = 0.60
+    guard_buffer_mul_range: float = 0.80
+    # ATR%が高いときはバッファを自動的に拡大（高ボラほど緩め）
+    use_dynamic_buffer_by_atrp: bool = True
+    guard_buffer_atrp_ref: float = 0.010   # 基準ATR%（=ATR/Price）。例: 1%
+    guard_buffer_atrp_slope: float = 1.0   # (atrp-ref)/ref に対する倍率増幅係数
+    guard_buffer_atr_cap: float = 0.30     # バッファ上限（k<=0.30 → ≤0.30*ATR）
+    # レジーム適応（例：trend_downではSHORTガードを緩和/無効化）
+    guard_disable_short_in_trend_down: bool = True
+    guard_disable_long_in_trend_up: bool = False
     
     # --- Micro pullback entry（1分/OBで押し目・戻りを待ってから入る） ---
     # 有効化すると、ガード通過直後に “ターゲット価格を待ってから” 以降の発注ロジックを実行します。

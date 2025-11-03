@@ -10,7 +10,56 @@ from typing import Dict, Any, Tuple
 
 from .config import STRATEGY as S
 from .flow_filters import compute_flow_metrics, compute_wall_pressure
+from typing import Any, Dict, Tuple
 
+# ===============================================================
+# Guard用ヘルパ（代替MA選択とATRバッファ計算）
+# ===============================================================
+def _get_guard_ma_and_name(ctx: Dict[str, Any], s10_fallback: float, S=S) -> Tuple[float, str]:
+    """
+    ガードで使うMAを選択（SMA10|SMA20|EMA10）。ctxに無ければSMA10へフォールバック。
+    戻り値: (ma_value, display_name)
+    """
+    t = str(getattr(S, "guard_ma_type", "SMA10")).upper()
+    if t == "SMA20":
+        val = float(ctx.get("sma20", s10_fallback))
+        return val, "SMA20"
+    if t == "EMA10":
+        # ema10 が無ければ ema9 → sma10 の順にフォールバック
+        val = float(ctx.get("ema10", ctx.get("ema9", s10_fallback)))
+        return val, "EMA10"
+    # 既定：SMA10
+    return float(ctx.get("sma10", s10_fallback)), "SMA10"
+
+def _calc_guard_buffer_k(regime: str, atr: float, price: float, S=S) -> float:
+    """
+    ガードのATRバッファ係数 k を算出（レジーム倍率＋ATR%に基づく動的拡張）。
+    k の単位は“ATR倍率”。最終的な価格幅は k * ATR。
+    """
+    base = float(getattr(S, "guard_buffer_atr_base", 0.10))
+    # レジーム倍率
+    if regime in ("trend_up", "trend_down"):
+        mul = float(getattr(S, "guard_buffer_mul_trend", 1.00))
+    elif regime == "range":
+        mul = float(getattr(S, "guard_buffer_mul_range", 0.80))
+    else:
+        mul = float(getattr(S, "guard_buffer_mul_neutral", 0.60))
+
+    k = base * mul
+    # ATR%で動的拡大（高ボラほど緩め、低ボラは基準のまま）
+    if bool(getattr(S, "use_dynamic_buffer_by_atrp", True)) and price > 0.0 and atr >= 0.0:
+        atrp = atr / price
+        ref  = float(getattr(S, "guard_buffer_atrp_ref", 0.010))
+        slope= float(getattr(S, "guard_buffer_atrp_slope", 1.0))
+        if atrp > ref and ref > 0:
+            k *= (1.0 + slope * (atrp - ref) / ref)
+    # 上限キャップ
+    k_cap = float(getattr(S, "guard_buffer_atr_cap", 0.30))
+    if k > k_cap:
+        k = k_cap
+    if k < 0.0:
+        k = 0.0
+    return k
 # =========================
 # 強制フリップ（反転）サポート
 # =========================
@@ -336,9 +385,17 @@ def decide_entry_guard_long(trades: list, book: dict, ctx: Dict[str, Any], S=S) 
     regime = classify_regime(ctx) # "trend_up" / "trend_down" / "range" / "neutral"
     ctx["regime"] = regime
 
-    # --- SMA10 / RSI の絶対ガード ---
-    if getattr(S, "require_close_gt_sma10_long", True) and not (price > s10):
-        return (False, "close≤SMA10(guard)")
+    # --- ガード（代替MA + ATRバッファ） ---
+    #   目的：SMA跨ぎの微細ノイズを許容（長期トレンド継続時の誤ブロックを減らす）
+    #   仕様：LONGは price >= MA - k*ATR を満たせば通過（kはレジーム/ATR%で動的）
+    gma, gname = _get_guard_ma_and_name(ctx, s10, S)
+    k_guard = _calc_guard_buffer_k(regime, atr, price, S)
+    if getattr(S, "require_close_gt_sma10_long", True):
+        # trend_up でガード無効にする設定ならスキップ（他ガードは後続で評価）
+        if not (regime == "trend_up" and bool(getattr(S, "guard_disable_long_in_trend_up", False))):
+            thr = gma - (k_guard * atr)
+            if price < thr:
+                return (False, f"close<{gname}-{k_guard:.2f}ATR(guard)")
     if rsi < float(getattr(S, "rsi_long_min", 55.0)):
         return (False, f"RSI<{int(getattr(S, 'rsi_long_min', 55))}(guard)")    
 
@@ -490,9 +547,16 @@ def decide_entry_guard_short(trades: list, book: dict, ctx: Dict[str, Any], S=S)
     # --- Regime classify (Slack 表示用にガード前で設定) ---
     regime = classify_regime(ctx) # "trend_up" / "trend_down" / "range" / "neutral"
     ctx["regime"] = regime
-    # --- SMA10 / RSI の絶対ガード ---
-    if getattr(S, "require_close_lt_sma10_short", True) and not (price < s10):
-        return (False, "close≥SMA10(guard)")
+    # --- ガード（代替MA + ATRバッファ） ---
+    #   仕様：SHORTは price <= MA + k*ATR を満たせば通過
+    gma, gname = _get_guard_ma_and_name(ctx, s10, S)
+    k_guard = _calc_guard_buffer_k(regime, atr, price, S)
+    if getattr(S, "require_close_lt_sma10_short", True):
+        # trend_down ではショート側を緩和／無効化（設定で切替）
+        if not (regime == "trend_down" and bool(getattr(S, "guard_disable_short_in_trend_down", True))):
+            thr = gma + (k_guard * atr)
+            if price > thr:
+                return (False, f"close>{gname}+{k_guard:.2f}ATR(guard)")
     if rsi > float(getattr(S, "rsi_short_max", 50.0)):
         return (False, f"RSI>{int(getattr(S, 'rsi_short_max', 50))}(guard)")
 
