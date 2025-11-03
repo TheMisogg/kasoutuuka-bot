@@ -232,8 +232,8 @@ class StrategyConfig:
     use_postonly_entries = True
 
         # RSI conditionsS
-    rsi_oversold: float = 40.0
-    rsi_overbought: float = 60.0
+    rsi_oversold: float = 30.0
+    rsi_overbought: float = 70.0
 
     # Multi-timeframe trend
     use_1h_trend: bool = True
@@ -255,9 +255,9 @@ class StrategyConfig:
     # SHORT：close < SMA10 を必須にする
     require_close_lt_sma10_short: bool = True
     # LONG側のRSI下限（推奨 55）
-    rsi_long_min: float = 70.0
+    rsi_long_min: float = 57.0
     # SHORT側のRSI上限（推奨 50）
-    rsi_short_max: float = 30.0
+    rsi_short_max: float = 48.0
 
     
     # --- Micro pullback entry（1分/OBで押し目・戻りを待ってから入る） ---
