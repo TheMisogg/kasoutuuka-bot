@@ -57,6 +57,26 @@ except Exception:
     pass
 
 
+# --- VWMA（出来高加重移動平均）をローカル実装 ---------------------------------
+def _vwma(prices: list[float], volumes: list[float], length: int) -> list[float]:
+    n = int(length)
+    if n <= 0:
+        return [0.0 for _ in prices]
+    out: list[float] = []
+    acc_pv = 0.0
+    acc_v = 0.0
+    q = [] # 窓: (p*v, v)
+    for i, (p, v) in enumerate(zip(prices, volumes)):
+        pv = float(p) * float(v)
+        q.append((pv, float(v)))
+        acc_pv += pv
+        acc_v += float(v)
+        if len(q) > n:
+            old_pv, old_v = q.pop(0)
+            acc_pv -= old_pv
+            acc_v -= old_v
+        out.append((acc_pv / acc_v) if acc_v > 0 else float(p))
+    return out
 
 def _has(name):
     return hasattr(_bx, name) if _bx else False
@@ -592,7 +612,18 @@ def http_get_klines(symbol: str, interval_min: int, limit: int = 300):
             for it in reversed(data["result"]["list"]):
                 ts = int(it[0])
                 start_ts = ts - interval_ms + 1
-                rows.append({"start": start_ts, "open": float(it[1]), "high": float(it[2]), "low": float(it[3]), "close": float(it[4])})
+                # Bybit v5 kline: [start, open, high, low, close, volume, turnover, ...]
+                vol = float(it[5]) if len(it) > 5 and it[5] is not None else 0.0
+                tov = float(it[6]) if len(it) > 6 and it[6] is not None else 0.0
+                rows.append({
+                    "start": start_ts,
+                    "open": float(it[1]),
+                    "high": float(it[2]),
+                    "low": float(it[3]),
+                    "close": float(it[4]),
+                    "volume": vol,
+                    "turnover": tov,
+                })
             if not rows:
                 raise RuntimeError("空のKlineが返されました")
             return rows
@@ -613,7 +644,15 @@ def get_klines_any(symbol: str, interval_min: int, limit: int = 300):
                 ts = int(r.get("timestamp") or r.get("start") or 0)
                 if ts < 10**12:
                     ts *= 1000
-                adapted.append({"start": ts, "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])})
+                adapted.append({
+                    "start": ts,
+                    "open": float(r["open"]),
+                    "high": float(r["high"]),
+                    "low": float(r["low"]),
+                    "close": float(r["close"]),
+                    "volume": float(r.get("volume") or r.get("vol") or 0.0),
+                    "turnover": float(r.get("turnover") or 0.0),
+                })
             return adapted
         except Exception:
             pass
@@ -694,17 +733,37 @@ def compute_indicators(rows):
     closes = [r["close"] for r in rows]
     highs  = [r["high"] for r in rows]
     lows   = [r["low"] for r in rows]
+    vols = [float(r.get("volume", 0.0)) for r in rows]
     rsi_vals = rsi(closes, int(getattr(S, "rsi_period", 14)))
     macd_line, signal_line, _ = macd(closes,
                                      int(getattr(S, "macd_fast", 12)),
                                      int(getattr(S, "macd_slow", 26)),
                                      int(getattr(S, "macd_signal", 9)))
+    macd_hist = [float(m) - float(s) for m, s in zip(macd_line, signal_line)]
     atr_vals = atr(highs, lows, closes, int(getattr(S, "atr_period", 14)))
     sma10 = sma(closes, 10)
     sma50 = sma(closes, 50)
+    # VWMA（出来高加重MA）
+    vw_fast_len = int(getattr(S, "vwma_fast_len", 20))
+    vw_slow_len = int(getattr(S, "vwma_slow_len", 50))
+    vwma_fast = _vwma(closes, vols, vw_fast_len)
+    vwma_slow = _vwma(closes, vols, vw_slow_len)
+    # 出来高MA（ボリューム拡張検出用）
+    vol_ma_len = int(getattr(S, "volume_ma_len", 20))
+    vol_ma = sma(vols, vol_ma_len)
     return {
-        "rsi": rsi_vals, "macd": macd_line, "signal": signal_line, "atr": atr_vals,
-        "sma10": sma10, "sma50": sma50, "close": closes, "high": highs, "low": lows,
+        "rsi": rsi_vals,
+        "macd": macd_line,
+        "signal": signal_line,
+        "macd_hist": macd_hist,
+        "atr": atr_vals,
+        "sma10": sma10,
+        "sma50": sma50,
+        "vwma_fast": vwma_fast,
+        "vwma_slow": vwma_slow,
+        "volume": vols,
+        "vol_ma": vol_ma,
+        "close": closes, "high": highs, "low": lows,
         "start": [r["start"] for r in rows]
     }
 
@@ -1009,6 +1068,13 @@ def run_loop():
             a   = float(ind["atr"][idx])
             s10 = float(ind["sma10"][idx])
             s50 = float(ind["sma50"][idx])
+            # 追加: MACDヒスト・VWMA・出来高系
+            mh = float((ind.get("macd_hist") or [0.0])[idx])
+            mh_p = float((ind.get("macd_hist") or [0.0, 0.0])[idx-1]) if idx > 0 else mh
+            vwf = float((ind.get("vwma_fast") or [s10])[idx])
+            vws = float((ind.get("vwma_slow") or [s50])[idx])
+            vol_n = float((ind.get("volume") or [0.0])[idx])
+            vol_m = float((ind.get("vol_ma") or [0.0])[idx])
 
             # === EdgeSignal: レジーム更新（ATR%/ADX） ===
             sig = None
@@ -1373,6 +1439,9 @@ def run_loop():
             ctx = {
                 "price": c, "atr": a, "sma10": s10, "sma50": s50,
                 "rsi": r, "macd": m, "macd_sig": sgn,
+                "macd_hist": mh, "macd_hist_prev": mh_p,
+                "vwma_fast": vwf, "vwma_slow": vws,
+                "volume": vol_n, "vol_ma": vol_m,
                 "dist_max_atr": ctx_dist_max,
                 "dist_atr": float(dist_atr),
                 "edge_votes": int(edge_votes),

@@ -177,6 +177,10 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
     adx   = _g("adx", 0.0)  # 5m
     s10   = _g("sma10", _g("ema9", price))
     s50   = _g("sma50", _g("ema21", s10))
+    # VWMA（あれば優先的に利用）
+    use_vwma = bool(getattr(S, "use_vwma_in_regime", True)) if "S" in globals() else True
+    vwf = _g("vwma_fast", _g("vwma20", s10))
+    vws = _g("vwma_slow", _g("vwma50", s50))
     macd  = _g("macd", 0.0)
     msig  = _g("macd_sig", 0.0)
     rsi   = _g("rsi14", _g("rsi", 50.0))
@@ -213,7 +217,7 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
         ctx["sudden_move"] = True
         ctx["price_change_5m"] = price_change_5m
 
-    # --- MTF整合（5m × 15m/1h）: EMA9/EMA21 + ADX ---
+    # --- MTF整合（5m × 15m/1h）: EMA9/EMA21 + ADX（VWMAがあればそれも尊重 ---
     adx_5m_min  = float(getattr(S, "adx_5m_min", 25.0))
     adx_15m_min = float(getattr(S, "adx_15m_min", 20.0))
     adx_1h_min  = float(getattr(S, "adx_1h_min", 18.0))
@@ -227,8 +231,13 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
     adx_15  = _g("adx_15m", _g("adx15", 0.0))
     adx_1h  = _g("adx_1h",  _g("adx60", 0.0))
 
-    m5_up   = (adx >= adx_5m_min)  and (ema9_5  > ema21_5)
-    m5_down = (adx >= adx_5m_min)  and (ema9_5  < ema21_5)
+    # 5mは VWMAクロスがあればそちらを優先（無ければEMA/SMA）
+    if use_vwma and (vwf != 0 or vws != 0):
+        m5_up = (adx >= adx_5m_min) and (vwf > vws)
+        m5_down = (adx >= adx_5m_min) and (vwf < vws)
+    else:
+        m5_up = (adx >= adx_5m_min) and (ema9_5 > ema21_5)
+        m5_down = (adx >= adx_5m_min) and (ema9_5 < ema21_5)
     m15_up  = (adx_15 >= adx_15m_min) and (ema9_15 > ema21_15)
     m15_down= (adx_15 >= adx_15m_min) and (ema9_15 < ema21_15)
     h1_up   = (adx_1h >= adx_1h_min)   and (ema9_1h > ema21_1h)
@@ -240,13 +249,15 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
 
     # --- “強さスコア”（上昇/下降を別々に採点） ---
     # 使える値が無ければ各条件はFalse扱い（堅牢化）
-    # MA整列: ema_fast > ema_mid > ema_slow（無ければ fast>mid 判定のみ）
-    ema_fast = ema9_5
-    ema_mid  = ema21_5
-    ema_slow = _g("ema50", _g("sma200", ema_mid + 1.0))
+    # MA整列: VWMA優先 → EMA → SMA
+    base_fast = vwf if use_vwma else ema9_5
+    base_mid = vws if use_vwma else ema21_5
+    ema_fast = base_fast
+    ema_mid = base_mid
+    ema_slow = _g("ema50", _g("sma200", (ema_mid if ema_mid else s50) + 1.0))
     have_slow= ("ema50" in ctx) or ("sma200" in ctx)
-    ma_up    = (ema_fast > ema_mid) and (ema_mid > ema_slow if have_slow else True)
-    ma_down  = (ema_fast < ema_mid) and (ema_mid < ema_slow if have_slow else True)
+    ma_up = (ema_fast > ema_mid) and (ema_mid > ema_slow if have_slow else True)
+    ma_down = (ema_fast < ema_mid) and (ema_mid < ema_slow if have_slow else True)
 
     adx_strong = adx >= float(getattr(S, "adx_strong_min", 23.0))
     vol        = _g("volume", _g("vol", 0.0))
@@ -255,10 +266,13 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
     bbw        = _g("bb_width", _g("bb_w", 0.0))
     bbw_ma     = _g("bb_width_ma", _g("bb_w_ma", 0.0))
     bb_expand  = (bbw_ma > 0.0) and (bbw > bbw_ma)
-    mh         = _g("macd_hist", _g("macd_histogram", 0.0))
-    mh_prev    = _g("macd_hist_prev", _g("macd_hist_1", mh))
-    mh_up      = (mh > 0.0) and (mh >= mh_prev)
-    mh_down    = (mh < 0.0) and (mh <= mh_prev)
+    mh = _g("macd_hist", _g("macd_histogram", 0.0))
+    mh_prev = _g("macd_hist_prev", _g("macd_hist_1", mh))
+    # ヒストの“絶対値”と“傾き”で勢いを評価
+    mh_abs_min = float(getattr(S, "macd_hist_abs_min", 0.0)) if "S" in globals() else 0.0
+    slope_min = float(getattr(S, "macd_hist_slope_min", 0.0)) if "S" in globals() else 0.0
+    mh_up = (mh > 0.0) and ((mh - mh_prev) >= slope_min) and (abs(mh) >= mh_abs_min)
+    mh_down = (mh < 0.0) and ((mh - mh_prev) <= -slope_min) and (abs(mh) >= mh_abs_min)
 
     rsi_up     = (rsi >= float(getattr(S, "rsi_strong_min", 60.0))) and (rsi <= float(getattr(S, "rsi_strong_max", 80.0)))
     rsi_down   = (rsi <= float(getattr(S, "rsi_weak_max", 40.0)))   and (rsi >= float(getattr(S, "rsi_weak_min", 20.0)))
@@ -298,8 +312,11 @@ def classify_regime(ctx: Dict[str, Any]) -> str:
         gate_trend = atr_gate or adx_gate
 
     # --- 方向確定（MTF整合があれば優先、無ければ5mのMA+MACD整合） ---
-    up_dir   = (s10 > s50 and macd >= msig) or align_up
-    down_dir = (s10 < s50 and macd <= msig) or align_down
+    # 方向: SMA10/50 と MACD、加えて VWMA の整合も見る
+    vw_ok_up = (vwf > vws) if use_vwma else False
+    vw_ok_down = (vwf < vws) if use_vwma else False
+    up_dir = ((s10 > s50 and macd >= msig) or align_up or vw_ok_up)
+    down_dir = ((s10 < s50 and macd <= msig) or align_down or vw_ok_down)
 
     if gate_trend:
         if up_dir and not down_dir:

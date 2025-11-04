@@ -47,10 +47,24 @@ class StrategyConfig:
     sma_slow: int = 50
     adx_period: int = 14
 
+    # --- VWMA / MACDヒストグラム 設定 ---
+    vwma_fast_len: int = 20
+    vwma_slow_len: int = 50
+    use_vwma_in_regime: bool = True
+    macd_hist_abs_min: float = 0.0 # |hist|がこの値未満なら勢いとしては弱い扱い（0で無効）
+    macd_hist_slope_min: float = 0.0 # 上昇: Δhist >= 0、下降: Δhist <= 0（0で“非負/非正”）
+    volume_ma_len: int = 20 # 出来高MA（ボリューム拡張判定用）
+
+    # 1Hトレンド確認用（main.py内のget_1h_trendが参照）
+    trend_confirmation_sma_period: int = 200
     # --- Regime gates ---
     atrp_trend_min: float = 0.006
     adx_trend_min: float = 16.0
 
+    # レンジ先判定用（flow_filters_dynamic.classify_regimeで参照）
+    atrp_range_max: float = 0.008
+    sma_confluence_atr_k: float = 0.30
+    
     # --- Pullback ---
     entry_pullback_atr: float = 0.25
     entry_pullback_atr_trend_min: float = 0.35
@@ -255,9 +269,9 @@ class StrategyConfig:
     # SHORT：close < SMA10 を必須にする
     require_close_lt_sma10_short: bool = True
     # LONG側のRSI下限（推奨 55）
-    rsi_long_min: float = 60.0
+    rsi_long_min: float = 55.0
     # SHORT側のRSI上限（推奨 50）
-    rsi_short_max: float = 40.0
+    rsi_short_max: float = 50.0
 
     # === Guard 緩和・代替指標・動的バッファ ======================
     # ガードで参照する移動平均（SMA10|SMA20|EMA10）。未提供ならSMA10にフォールバック
@@ -275,7 +289,7 @@ class StrategyConfig:
     guard_buffer_atr_cap: float = 0.30     # バッファ上限（k<=0.30 → ≤0.30*ATR）
     # レジーム適応（例：trend_downではSHORTガードを緩和/無効化）
     guard_disable_short_in_trend_down: bool = True
-    guard_disable_long_in_trend_up: bool = False
+    guard_disable_long_in_trend_up: bool = True
     
     # --- Micro pullback entry（1分/OBで押し目・戻りを待ってから入る） ---
     # 有効化すると、ガード通過直後に “ターゲット価格を待ってから” 以降の発注ロジックを実行します。
