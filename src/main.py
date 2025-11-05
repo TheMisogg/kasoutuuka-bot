@@ -307,9 +307,9 @@ def _strong_flow_override(edge, edge_votes: int, S=S) -> tuple[bool, str]:
                        getattr(S, "cooldown_override_votes", 3)))
 
     hits = 0
-    if abs(ofi_z) >= ofi_th: hits += 1
-    if (ofi_z >= 0 and cons_buy >= cons_th) or (ofi_z < 0 and cons_sell >= cons_th): hits += 1
-    if int(edge_votes or 0) >= votes_th: hits += 1
+    if abs(ofi_z) >= th_ofi: hits += 1
+    if (ofi_z >= 0 and cons_buy >= th_cons) or (ofi_z < 0 and cons_sell >= th_cons): hits += 1
+    if int(edge_votes or 0) >= th_votes: hits += 1
     strong = hits >= int(getattr(S, "regime_override_min_triggers", 2))
     note = f"OFI z={ofi_z:.2f}, cons={max(cons_buy,cons_sell)}, votes={edge_votes}"
     return strong, note
@@ -1554,7 +1554,9 @@ def run_loop():
                     state['last_kline_start'] = last_start
                     save_state(state)
                     time.sleep(float(S.poll_interval_sec))
-                continue
+                # ← continue は "スキップ" の場合のみ
+                if not ok:
+                    continue
 
             # 強化チェック等で方向を参照できるよう明示
             ctx["side_for_entry"] = side_for_entry
@@ -1781,6 +1783,8 @@ def run_loop():
                         _k = max(_base, _trend_min) if ctx.get("regime") == "trend_up" else _base
                     else:
                         _k = float(getattr(S, "entry_pullback_atr", 0.25))
+                                            # 使う引き幅（ATR×k）
+                    pull = float(_k) * float(a)
                     # 5分シグナル直後に板へ PostOnly 指値を即配置
                     if side == "LONG":
                         try:
