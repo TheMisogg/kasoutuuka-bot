@@ -306,7 +306,11 @@ def _strong_flow_override(edge, edge_votes: int, S=S) -> tuple[bool, str]:
     th_votes = int(getattr(S, "regime_override_votes",
                        getattr(S, "cooldown_override_votes", 3)))
 
-    strong = (abs(ofi_z) >= th_ofi) or (max(cons_buy, cons_sell) >= th_cons) or (int(edge_votes or 0) >= th_votes)
+    hits = 0
+    if abs(ofi_z) >= ofi_th: hits += 1
+    if (ofi_z >= 0 and cons_buy >= cons_th) or (ofi_z < 0 and cons_sell >= cons_th): hits += 1
+    if int(edge_votes or 0) >= votes_th: hits += 1
+    strong = hits >= int(getattr(S, "regime_override_min_triggers", 2))
     note = f"OFI z={ofi_z:.2f}, cons={max(cons_buy,cons_sell)}, votes={edge_votes}"
     return strong, note
 
@@ -1298,7 +1302,8 @@ def run_loop():
                                             getattr(S, "cooldown_override_cons", 3)))
                             votes_th = int(getattr(S, "regime_override_votes",
                                             getattr(S, "cooldown_override_votes", 3)))
-                            if (abs(ofi_z) >= ofi_th) or (max(cons_buy, cons_sell) >= cons_th) or (int(edge_votes or 0) >= votes_th):
+                            same_dir_cons = (ofi_z >= 0 and cons_buy  >= cons_th) or (ofi_z < 0 and cons_sell >= cons_th)
+                            if (abs(ofi_z) >= ofi_th) or same_dir_cons or (int(edge_votes or 0) >= votes_th):
                                 sig = "LONG" if ofi_z >= 0 else "SHORT"
                                 notify_slack(
                                     f"◯ regime override by strong_flow → {sig} "
@@ -1531,12 +1536,24 @@ def run_loop():
 
             # ガード結果を“必ず”反映（これが無いと NG でも先へ進む）
             if not ok:
-                _bump_skip(state, "guard_ng")
-                notify_slack(f"ℹ️ スキップ: エントリーガード不成立 ({why})")
-                last_handled_kline = last_start
-                state['last_kline_start'] = last_start
-                save_state(state)
-                time.sleep(float(S.poll_interval_sec))
+                _why = str(why or "")
+                # ガード理由が「待ち」（SHORT=戻り売り待ち / LONG=押し目待ち）のときは
+                # スキップせずに PostOnly 指値を置く通常フローへ進める
+                _guard_wait = (
+                    (side_for_entry == "SHORT" and "戻り売り待ち" in _why) or
+                    (side_for_entry == "LONG"  and "押し目待ち" in _why)
+                )
+                if _guard_wait and getattr(S, "use_postonly_entries", True) and _place_postonly_fn:
+                    ctx["force_pullback_limit"] = True  # 指値側で引き幅を“待ち”仕様に
+                    notify_slack("🧱 ガード=待ち → 指値に切替（PostOnlyで配置します）")
+                    ok = True  # このまま通常の発注フローへ
+                else:
+                    _bump_skip(state, "guard_ng")
+                    notify_slack(f"ℹ️ スキップ: エントリーガード不成立 ({why})")
+                    last_handled_kline = last_start
+                    state['last_kline_start'] = last_start
+                    save_state(state)
+                    time.sleep(float(S.poll_interval_sec))
                 continue
 
             # 強化チェック等で方向を参照できるよう明示
@@ -1752,12 +1769,18 @@ def run_loop():
                             _cancel_all_fn(S.symbol)
                         except Exception:
                             pass
-                    # pb_flip_follow の時は専用の k で「現値から有利側へ引く」価格に置く
+                    # 引き幅k（ATR×k）
+                    # 1) pb_flip_follow 時は専用k
+                    # 2) ガードが“待ち”で来た場合はレジームに応じて深め（trend_up は min=entry_pullback_atr_trend_min）
+                    # 3) それ以外は通常の entry_pullback_atr
                     if 'pb_flip_follow' in locals() and pb_flip_follow:
                         _k = float(getattr(S, "pb_flip_pull_atr", getattr(S, "entry_pullback_atr", 0.25)))
+                    elif bool(ctx.get("force_pullback_limit", False)):
+                        _base = float(getattr(S, "entry_pullback_atr", 0.25))
+                        _trend_min = float(getattr(S, "entry_pullback_atr_trend_min", _base))
+                        _k = max(_base, _trend_min) if ctx.get("regime") == "trend_up" else _base
                     else:
                         _k = float(getattr(S, "entry_pullback_atr", 0.25))
-                    pull = _k * a
                     # 5分シグナル直後に板へ PostOnly 指値を即配置
                     if side == "LONG":
                         try:
