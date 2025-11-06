@@ -972,6 +972,7 @@ def send_startup_status(state):
 
 def run_loop():
     state = load_state()
+    state.setdefault("watch_orders", [])
     state = state or {}
     
     # === ニュートラル取引カウントのリセット処理 ===
@@ -979,6 +980,158 @@ def run_loop():
     _get_order_rt_fn   = getattr(_bx, "get_order_realtime", None) if _bx else None
     _get_execs_fn      = getattr(_bx, "get_executions_by_order", None) if _bx else None
     _cancel_order_fn   = getattr(_bx, "cancel_order", None) if _bx else None
+        # --- PostOnlyキャンセル検証 / 部分約定取り込み / 取引所との整合ウォッチ ---
+    def _order_status_local(oid: str) -> tuple[str, float, float]:
+        """(status, cumExecQty, avgPrice) を返す。失敗時は空/0."""
+        st, filled, avg = "", 0.0, 0.0
+        if not oid or not _get_order_rt_fn:
+            return st, filled, avg
+        try:
+            od = _get_order_rt_fn(S.symbol, oid)
+            items = (od.get("result") or {}).get("list") or []
+            o = items[0] if items else {}
+            st = str(o.get("orderStatus") or o.get("status") or "")
+            filled = float(o.get("cumExecQty") or o.get("cumQty") or 0.0)
+            avg = float(o.get("avgPrice") or 0.0)
+        except Exception:
+            pass
+        return st, filled, avg
+
+    def _adopt_position_from_fill(side: str, sz: float, avg_px: float,
+                                  tp_price: float, sl_price: float,
+                                  prof: dict, overrides: dict | None):
+        """キャンセル直後/監視中に検知した実約定をローカルstateへ反映"""
+        if sz <= 0:
+            return
+        fee_rate = float(getattr(S, "maker_fee_rate",
+                         getattr(S, "taker_fee_rate", 0.0007)))
+        notional = float(sz) * float(avg_px or 0.0)
+        buy_fee  = notional * fee_rate
+        pos = {
+            "side": "long" if side == "LONG" else "short",
+            "entry_price": float(avg_px or 0.0),
+            "qty": float(sz),
+            "buy_fee": float(buy_fee),
+            "tp_price": float(tp_price),
+            "sl_price": float(sl_price),
+            "time": datetime.utcnow().isoformat(),
+            "be_k":  float((prof or {}).get("be_k", 0.0)),
+            "trail_k": float((prof or {}).get("trail_k", 0.0)),
+            "profile": str((prof or {}).get("name","")),
+            "flip": bool((overrides or {}).get("force_flip", False)),
+            "risk_sl_dist": abs(float(avg_px or 0.0) - float(sl_price)),
+        }
+        state["positions"].append(pos)
+        state["last_entry_time"] = datetime.utcnow().isoformat()
+        notify_slack(
+            f"💰 エントリー({side})[キャンセル後の実充足検知]: "
+            f"{(avg_px or 0.0):.4f} | TP {tp_price:.4f} | SL {sl_price:.4f} | Qty {sz:.4f}"
+        )
+
+    def _watchdog_open_orders():
+        """キャンセルしたはずの注文を継続監視し、約定→state反映 / 完全キャンセルを確認する"""
+        wlist = list(state.get("watch_orders") or [])
+        if not wlist:
+            return
+        new_w = []
+        for w in wlist:
+            oid = w.get("oid")
+            st, fq, ap = _order_status_local(oid)
+            if fq and fq > 0.0:
+                _adopt_position_from_fill(
+                    w.get("side","LONG"),
+                    float(fq),
+                    float(ap or 0.0) or float(w.get("last_price", 0.0) or 0.0),
+                    float(w.get("tp")),
+                    float(w.get("sl")),
+                    w.get("prof") or {},
+                    w.get("overrides") or {},
+                )
+                continue  # 取り込み完了 → 監視から除外
+            if st and st.lower().startswith("cancel"):
+                continue  # 完全キャンセル確認 → 除外
+            # 監視継続（TTL超過で最終キャンセル再試行）
+            if time.time() - float(w.get("_created", time.time())) > float(getattr(S, "postonly_watchdog_ttl_sec", 600)):
+                if _cancel_order_fn and oid:
+                    try:
+                        _cancel_order_fn(S.symbol, oid)
+                    except Exception:
+                        pass
+                continue
+            new_w.append(w)
+        if new_w != wlist:
+            state["watch_orders"] = new_w
+            save_state(state)
+
+    def _reconcile_with_exchange(current_price: float):
+        """定期的に取引所のネット玉とローカルstateを照合し、乖離時に対処"""
+        if not _get_positions_fn:
+            return
+        # ローカルのネット数量
+        q_local = 0.0
+        for p in state.get("positions", []):
+            q = float(p.get("qty", 0))
+            q_local += q if (p.get("side","").lower() == "long") else -q
+        # 取引所のネット数量と平均価格
+        try:
+            res = _get_positions_fn(S.symbol)
+        except Exception:
+            return
+        items = []
+        if isinstance(res, dict):
+            r = res.get("result") or res.get("data") or res
+            items = r.get("list") or r.get("positions") or r.get("data") or []
+        elif isinstance(res, list):
+            items = res
+        q_ex, px_sum, q_sum = 0.0, 0.0, 0.0
+        for it in items:
+            q = it.get("size") or it.get("qty") or it.get("positionQty")
+            q = float(q or 0.0)
+            if abs(q) <= 0:
+                continue
+            side = (it.get("side") or it.get("positionSide") or "").lower()
+            ep = float(it.get("avgPrice") or it.get("entryPrice") or 0.0)
+            if side in ("buy","long"):
+                q_ex += q
+            elif side in ("sell","short"):
+                q_ex -= q
+            else:
+                q_ex += q if q > 0 else -q
+            if ep > 0:
+                px_sum += ep * q
+                q_sum  += q
+        avg_px_ex = (px_sum / q_sum) if q_sum > 0 else 0.0
+
+        tol = float(getattr(S, "sync_tolerance_qty", 1e-6))
+        if abs(q_ex - q_local) <= tol:
+            return  # 整合
+
+        # 乖離対処：①自動クローズ（希望時） ②ローカルへ取り込み
+        if bool(getattr(S, "auto_flatten_on_desync", False)) and abs(q_ex) > 0:
+            try:
+                close_side = "Sell" if q_ex > 0 else "Buy"
+                q_to_close = abs(q_ex)
+                if _place_linear_fn:
+                    res = _place_linear_fn(S.symbol, close_side, q_to_close, True)
+                    notify_slack(f"🚨 自動解消(desync): {close_side} {q_to_close:.4f} reduce-only | ret={res}")
+            except Exception as e:
+                notify_slack(f":x: 自動解消失敗: {e}")
+        else:
+            side = "LONG" if q_ex > 0 else "SHORT"
+            # 取り込み時のTP/SLは現在のATR/プロファイルで安全側に再設定
+            prof = _decide_tp_sl_profile("neutral", side, 0, 0.0, None, S)
+            atr_v = float(state.get("atr_buf", [0.0])[-1] if state.get("atr_buf") else 0.0)
+            sl_k  = float(prof.get("sl_k", 1.0))
+            sl_d  = max(sl_k * atr_v, float(getattr(S, "min_sl_usd", 0.20)))
+            base  = avg_px_ex or current_price
+            if side == "LONG":
+                sl = base - sl_d
+                tp = base + float(prof.get("tp_rr", 1.5)) * sl_d
+            else:
+                sl = base + sl_d
+                tp = base - float(prof.get("tp_rr", 1.5)) * sl_d
+            _adopt_position_from_fill(side, abs(q_ex), base, tp, sl, prof, {})
+            notify_slack("⚠️ 取引所≠ローカルの不整合を検知 → ローカルに反映しました")
     # 状態初期化時に追加
     if "last_neutral_reset" not in state:
         state["last_neutral_reset"] = datetime.utcnow().isoformat()
@@ -1360,6 +1513,15 @@ def run_loop():
                     m2 = {}
                 sigmsg += f" | OFI z={float(m2.get('ofi_z', ofi_z)):.2f} votes={int(m2.get('edge_votes', edge_votes))}"
             notify_slack(f"🧪 シグナル確認: {sigmsg}")
+
+                        # キャンセル済みのはずの注文を監視（約定→即時取り込み）
+            _watchdog_open_orders()
+
+            # 一定間隔で取引所のネット玉と同期（既定30s）
+            if time.time() - float(state.get("_last_sync", 0)) > float(getattr(S, "sync_interval_sec", 30)):
+                _reconcile_with_exchange(c)
+                state["_last_sync"] = time.time()
+                save_state(state)
 
             # === C) 連続エントリー抑制（ATR連動の動的クールダウン + 強フロー解除） ===
             # 1) ATRバッファを更新（stateに保存）
@@ -1936,14 +2098,38 @@ def run_loop():
 
                             # タイムアウト
                             if (now - t0) > float(fill_timeout):
+                                # まずはキャンセル要求
                                 if cancel_to and _cancel_order_fn and oid:
                                     try:
                                         _cancel_order_fn(S.symbol, oid)
                                         notify_slack(f"🧹 PostOnlyキャンセル（timeout {fill_timeout}s） id={oid}")
                                     except Exception as e:
                                         notify_slack(f":x: PostOnlyキャンセル失敗: {e}")
+
+                                # キャンセル直後の実状態を必ず確認（部分約定はここで取り込む）
+                                st_now, fq_now, ap_now = _order_status_local(oid)
+                                if fq_now and fq_now > 0.0:
+                                    _adopt_position_from_fill(
+                                        side, float(fq_now), float(ap_now or 0.0) or float(c),
+                                        float(tp_price), float(sl_price), prof, _overrides if '_overrides' in locals() else {}
+                                    )
+                                    last_handled_kline = last_start
+                                    state['last_kline_start'] = last_start
+                                    save_state(state)
+                                    time.sleep(float(S.poll_interval_sec))
+                                    break
+
+                                # まだ未キャンセル/未約定 → ウォッチリストへ登録して継続監視
+                                state.setdefault("watch_orders", []).append({
+                                    "oid": oid, "side": side, "qty": float(qty),
+                                    "tp": float(tp_price), "sl": float(sl_price),
+                                    "prof": prof, "overrides": _overrides if '_overrides' in locals() else {},
+                                    "_created": time.time(), "last_price": float(c),
+                                })
                                 _bump_skip(state, "other")
-                                notify_slack(f"ℹ️ スキップ: PostOnly未充足 timeout（fill={filled_qty:.4f}/{qty:.4f}）")
+                                notify_slack(
+                                    f"ℹ️ スキップ: PostOnly未充足 timeout（fill={filled_qty:.4f}/{qty:.4f}）→監視に移行"
+                                )
                                 last_handled_kline = last_start
                                 state['last_kline_start'] = last_start
                                 save_state(state)

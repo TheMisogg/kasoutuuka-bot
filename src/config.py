@@ -64,7 +64,7 @@ class StrategyConfig:
     # レンジ先判定用（flow_filters_dynamic.classify_regimeで参照）
     atrp_range_max: float = 0.008
     sma_confluence_atr_k: float = 0.30
-    
+
     # --- Pullback ---
     entry_pullback_atr: float = 0.25
     entry_pullback_atr_trend_min: float = 0.35
@@ -311,6 +311,12 @@ class StrategyConfig:
     postonly_min_fill_ratio: float = 0.25
     postonly_cancel_on_timeout: bool = True
     postonly_cancel_remainder_on_partial: bool = True
+
+    # STRATEGY に任意で追加（なくても gettattr の既定値で動作）
+    sync_interval_sec = 30                # 取引所↔ローカル整合チェック間隔(秒)
+    sync_tolerance_qty = 1e-6             # 数量の許容誤差
+    auto_flatten_on_desync = False        # 乖離時に自動クローズするか
+    postonly_watchdog_ttl_sec = 600       # 監視の最大秒数（過ぎたら最終キャンセル再試行）
 
     # 逆張りを許可するか（デフォルト：禁止）
     allow_countertrend: bool = False
