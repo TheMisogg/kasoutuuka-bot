@@ -1204,7 +1204,7 @@ def run_loop():
                 jst_active_hours=((16,0,0),(2,0,0)),
             )
             edge.start()
-            notify_slack(":electric_plug: EdgeSignalEngine 起動")
+            _log_once("edge_start", ":electric_plug: EdgeSignalEngine 起動", 600)
             edge.is_active_hours_jst = lambda: True  # ← 時間帯ふぃるふぃるたー無効化
         except Exception as e:
             notify_slack(f":x: EdgeSignalEngine 初期化失敗: {e}")
