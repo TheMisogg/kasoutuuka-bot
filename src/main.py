@@ -1172,6 +1172,7 @@ def run_loop():
     # ---- 監視/整合チェックをまとめたハウスキーピング ----
     def _housekeep_sync(c_hint: float | None = None):
         # PostOnly監視（キャンセル済みのはずの注文が後から約定していないか）
+        _flush_slack_queue()  # ← これを追加
         try:
             _watchdog_open_orders()
         except Exception:
