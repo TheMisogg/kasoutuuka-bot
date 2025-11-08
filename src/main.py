@@ -971,9 +971,9 @@ def send_startup_status(state):
 # ---------- メインループ ----------
 
 def run_loop():
-    state = load_state()
+    state = load_state() or {}
     state.setdefault("watch_orders", [])
-    state = state or {}
+    state.setdefault("_last_sync", 0.0)  # 追加: 同期タイムスタンプの初期化
     
     # === ニュートラル取引カウントのリセット処理 ===
     # ===== 追加①: bybit関数の参照を上の初期化ブロックに追記 =====
@@ -1023,6 +1023,7 @@ def run_loop():
         }
         state["positions"].append(pos)
         state["last_entry_time"] = datetime.utcnow().isoformat()
+        save_state(state)  # 追加: すぐ永続化（途中で continue してもポジション喪失しない）
         notify_slack(
             f"💰 エントリー({side})[キャンセル後の実充足検知]: "
             f"{(avg_px or 0.0):.4f} | TP {tp_price:.4f} | SL {sl_price:.4f} | Qty {sz:.4f}"
@@ -1168,6 +1169,23 @@ def run_loop():
     send_startup_status(state)
     notify_slack("✅ 監視開始（確定足待ち）")
 
+    # ---- 監視/整合チェックをまとめたハウスキーピング ----
+    def _housekeep_sync(c_hint: float | None = None):
+        # PostOnly監視（キャンセル済みのはずの注文が後から約定していないか）
+        try:
+            _watchdog_open_orders()
+        except Exception:
+            pass
+        # Bybit実在ポジションとローカルstateの整合を一定間隔で同期
+        try:
+            if time.time() - float(state.get("_last_sync", 0.0)) > float(getattr(S, "sync_interval_sec", 30)):
+                price = float(c_hint) if c_hint is not None else float(state.get("last_price", 0.0) or 0.0)
+                _reconcile_with_exchange(price)
+                state["_last_sync"] = time.time()
+                save_state(state)
+        except Exception:
+            pass
+
         # === EdgeSignalEngine 起動（板/約定/清算のWS） ===
     global edge
     if EDGE_ENABLED and edge is None:
@@ -1200,6 +1218,13 @@ def run_loop():
                 time.sleep(float(S.poll_interval_sec))
                 continue
 
+            # ★確定足待ちの前に、監視だけは毎ループ回す
+            try:
+                price_hint = float(rows[-1]["close"])
+            except Exception:
+                price_hint = None
+            _housekeep_sync(price_hint)   # 毎ループのPostOnly監視＆取引所同期
+            
             closed_idx = get_latest_closed_index(rows, int(S.interval_min))
             if closed_idx is None:
                 log_wait_once(rows[-1]["start"])
@@ -1512,16 +1537,10 @@ def run_loop():
                 except Exception:
                     m2 = {}
                 sigmsg += f" | OFI z={float(m2.get('ofi_z', ofi_z)):.2f} votes={int(m2.get('edge_votes', edge_votes))}"
+
             notify_slack(f"🧪 シグナル確認: {sigmsg}")
-
-                        # キャンセル済みのはずの注文を監視（約定→即時取り込み）
-            _watchdog_open_orders()
-
-            # 一定間隔で取引所のネット玉と同期（既定30s）
-            if time.time() - float(state.get("_last_sync", 0)) > float(getattr(S, "sync_interval_sec", 30)):
-                _reconcile_with_exchange(c)
-                state["_last_sync"] = time.time()
-                save_state(state)
+            # ★ここはユニファイして1行に
+            _housekeep_sync(c)
 
             # === C) 連続エントリー抑制（ATR連動の動的クールダウン + 強フロー解除） ===
             # 1) ATRバッファを更新（stateに保存）
