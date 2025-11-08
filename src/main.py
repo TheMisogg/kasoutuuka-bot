@@ -1173,8 +1173,11 @@ def run_loop():
             state["leverage_set"] = True
             save_state(state)
 
+    # 起動メッセージを即時に出す（レート制限キューに乗ってもここで吐き出す）
     send_startup_status(state)
+    _flush_slack_queue()
     notify_slack("✅ 監視開始（確定足待ち）")
+    _flush_slack_queue()
 
     # ---- 監視/整合チェックをまとめたハウスキーピング ----
     def _housekeep_sync(c_hint: float | None = None):
@@ -1205,10 +1208,11 @@ def run_loop():
             )
             edge.start()
             _log_once("edge_start", ":electric_plug: EdgeSignalEngine 起動", 600)
+            _flush_slack_queue()
             edge.is_active_hours_jst = lambda: True  # ← 時間帯ふぃるふぃるたー無効化
         except Exception as e:
             notify_slack(f":x: EdgeSignalEngine 初期化失敗: {e}")
-
+            _flush_slack_queue()
     backoff = 1
     while True:
         try:
