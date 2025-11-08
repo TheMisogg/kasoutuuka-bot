@@ -56,6 +56,13 @@ try:
 except Exception:
     pass
 
+_LOG_ONCE = {}
+def _log_once(key: str, msg: str, interval_sec: float = 60.0):
+    now = time.time()
+    last = _LOG_ONCE.get(key, 0.0)
+    if now - last >= interval_sec:
+        _LOG_ONCE[key] = now
+        notify_slack(msg)
 
 # --- VWMA（出来高加重移動平均）をローカル実装 ---------------------------------
 def _vwma(prices: list[float], volumes: list[float], length: int) -> list[float]:
@@ -1484,11 +1491,7 @@ def run_loop():
                             same_dir_cons = (ofi_z >= 0 and cons_buy  >= cons_th) or (ofi_z < 0 and cons_sell >= cons_th)
                             if (abs(ofi_z) >= ofi_th) or same_dir_cons or (int(edge_votes or 0) >= votes_th):
                                 sig = "LONG" if ofi_z >= 0 else "SHORT"
-                                notify_slack(
-                                    f"◯ regime override by strong_flow → {sig} "
-                                    f"(OFI z={ofi_z:.2f}, cons={max(cons_buy,cons_sell)}, votes={edge_votes})"
-                                )
-                                notify_slack(f"🔥 EdgeSignal {sig} | override(strong_flow)")
+                                notify_slack(f"🔥 EdgeSignal {sig} (override=strength) | {reasons} | OFI z={ofi_z:.2f} cons={max(cons_buy,cons_sell)} votes={edge_votes}")
                             else:
                                 # 理由文字列から集計キー
                                 reason_txt = " ".join([str(r).lower() for r in reasons])
@@ -1516,7 +1519,7 @@ def run_loop():
                     try:
                         if not met and hasattr(edge, "get_metrics_snapshot"):
                             met = edge.get_metrics_snapshot() or {}
-                        notify_slack(
+                        _log_once(
                             f"[DBG] OFI z={float(met.get('ofi_z',0)):.2f} | "
                             f"cons={int(met.get('cons_buy',0))}/{int(met.get('cons_sell',0))} | "
                             f"votes={int(met.get('edge_votes',0))} | "
@@ -1540,8 +1543,6 @@ def run_loop():
                 sigmsg += f" | OFI z={float(m2.get('ofi_z', ofi_z)):.2f} votes={int(m2.get('edge_votes', edge_votes))}"
 
             notify_slack(f"🧪 シグナル確認: {sigmsg}")
-            # ★ここはユニファイして1行に
-            _housekeep_sync(c)
 
             # === C) 連続エントリー抑制（ATR連動の動的クールダウン + 強フロー解除） ===
             # 1) ATRバッファを更新（stateに保存）
@@ -2012,6 +2013,7 @@ def run_loop():
                         filled_qty = 0.0
                         avg_fill_px = 0.0
                         last_note_ts = 0.0
+                        last_note_sig = ""
 
                         while True:
                             time.sleep(poll_iv)
@@ -2063,10 +2065,18 @@ def run_loop():
                             ratio = (filled_qty / float(qty)) if float(qty) > 0 else 0.0
                             now   = time.time()
 
-                            # 途中経過ログ（10秒に1回）
-                            if now - last_note_ts > 10.0:
+                            # 途中経過ログ（状態が変わった時 or 一定間隔）
+                            note_iv = float(getattr(S, "postonly_note_interval_sec", 30.0))  # 既定30秒
+                            sig = f"{status}|{filled_qty:.4f}/{qty:.4f}"
+                            if (now - last_note_ts >= note_iv) or (sig != last_note_sig):
                                 last_note_ts = now
-                                notify_slack(f"⏳ PostOnly監視: status={status or 'N/A'} fill={filled_qty:.4f}/{qty:.4f} avg={avg_fill_px or 0.0:.4f}")
+                                last_note_sig = sig
+                                _log_once(
+                                    f"po_note_{oid}",
+                                    f"⏳ PostOnly監視: status={status or 'N/A'} "
+                                    f"fill={filled_qty:.4f}/{qty:.4f} avg={avg_fill_px or 0.0:.4f}",
+                                    5.0  # 同じoidで5秒以内の重複は捨てる保険
+                                )
 
                             # 充足 → state 反映
                             if filled_qty > 0 and (full or (allow_part and ratio >= min_ratio)):
