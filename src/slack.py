@@ -1,117 +1,143 @@
-import os, json, urllib.request, urllib.error, time
+# src/slack.py
+import os, time, json, threading
+from collections import deque
+from urllib import request, error
 
-# --- STRATEGY を安全に取り込む（起動方法の違いに強い） ---
-try:
-    from .config import STRATEGY as S   # python -m src.main
-except Exception:
-    try:
-        from config import STRATEGY as S  # python src/main.py
-    except Exception:
-        class _Empty: pass
-        S = _Empty()
+# ========= 設定（必要ならSTRATEGYや.envで上書き） =========
+_MIN_INTERVAL_SEC     = float(os.getenv("SLACK_MIN_INTERVAL_SEC", "1.5"))  # 1.5秒/件
+_BURST_TOKENS         = float(os.getenv("SLACK_BURST", "3"))               # 初期バースト
+_DRAIN_PER_FLUSH      = int(os.getenv("SLACK_DRAIN_PER_TICK", "2"))        # 1回のflushで送る最大件数
+_DEFAULT_RETRY_SEC    = float(os.getenv("SLACK_RETRY_DEFAULT_SEC", "60"))  # Retry-Afterが無い429用
+# ============================================================
 
-# ========== 生送信（429は上位でハンドルするのでここではprintしない） ==========
-def _send_slack_raw(text: str) -> None:
-    url = os.getenv("SLACK_WEBHOOK_URL")
-    if not url or not text:
-        return
-    data = json.dumps({"text": text}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    # 成功すれば何も返さない。HTTPErrorは上位へ投げる。
-    with urllib.request.urlopen(req, timeout=10) as _:
-        return
+_WEBHOOK_URL   = os.getenv("SLACK_WEBHOOK_URL")
+_BOT_TOKEN     = os.getenv("SLACK_BOT_TOKEN")        # xoxb-...
+_CHANNEL_ID    = os.getenv("SLACK_CHANNEL_ID")       # Cxxxx のID（#general などの名前ではなくID）
 
-# ========== レート制限 & リトライ（トークンバケット＋Retry-After） ==========
-_SLACK_MIN_INTERVAL = float(getattr(S, "slack_min_interval_sec", 1.0))  # 最短間隔
-_SLACK_BURST        = int(getattr(S, "slack_burst", 6))                 # バースト数
-_SLACK_RETRY_DEFAULT= float(getattr(S, "slack_retry_default_sec", 30))  # Retry-Afterが無い場合の待機
+_SLACK_QUEUE   = deque()      # (text, payload_dict)
+_LAST_SEND_AT  = 0.0
+_TOKENS        = _BURST_TOKENS
+_SUSPEND_UNTIL = 0.0
+_LOCK          = threading.Lock()
 
-_SLACK_BUCKET = {"tokens": float(_SLACK_BURST), "last": time.monotonic()}
-_SLACK_QUEUE  = []             # 未送信キュー
-_SLACK_SUSPEND_UNTIL = 0.0     # 429等で一時停止している間の終端時刻（monotonic秒）
+def slack_configured() -> bool:
+    return bool(_WEBHOOK_URL or (_BOT_TOKEN and _CHANNEL_ID))
 
-def _retry_after_seconds(err: Exception) -> float:
-    """HTTP 429 の Retry-After 秒数を取り出す（無ければ既定値）。"""
-    if isinstance(err, urllib.error.HTTPError) and err.code == 429:
-        try:
-            ra = err.headers.get("Retry-After")
-            if ra is None:  # 一部は小文字で来る
-                ra = err.headers.get("retry-after")
-            if ra:
-                return float(ra)
-        except Exception:
-            pass
-        return _SLACK_RETRY_DEFAULT
-    return 0.0
+def notify_slack(text: str, **kwargs) -> None:
+    """
+    送信要求をキューに積む。kwargsは blocks 等の追加フィールド用。
+    """
+    with _LOCK:
+        _SLACK_QUEUE.append((text, kwargs))
 
-def _slack_refill() -> None:
-    """トークン補充。サスペンド中は補充しない（送信もさせない）。"""
-    global _SLACK_BUCKET
+def _refill_tokens():
+    global _TOKENS, _LAST_SEND_AT
     now = time.monotonic()
-    if now < _SLACK_SUSPEND_UNTIL:
+    if _LAST_SEND_AT == 0.0:
+        _LAST_SEND_AT = now
         return
-    elapsed = now - _SLACK_BUCKET["last"]
-    _SLACK_BUCKET["tokens"] = min(
-        float(_SLACK_BURST),
-        float(_SLACK_BUCKET["tokens"]) + elapsed / _SLACK_MIN_INTERVAL
-    )
-    _SLACK_BUCKET["last"] = now
+    # トークン回復（1/_MIN_INTERVAL_SEC 件/秒）
+    rate = 1.0 / max(_MIN_INTERVAL_SEC, 0.1)
+    _TOKENS = min(_BURST_TOKENS, _TOKENS + (now - _LAST_SEND_AT) * rate)
+    _LAST_SEND_AT = now
 
-def notify_slack(message: str) -> None:
-    """外部公開：Slack送信（レート制限＆Retry-Afterつき）"""
-    global _SLACK_SUSPEND_UNTIL, _SLACK_BUCKET
-    if not message:
+def _suspend(sec: float):
+    global _SUSPEND_UNTIL
+    _SUSPEND_UNTIL = max(_SUSPEND_UNTIL, time.monotonic() + max(sec, 1.0))
+    print(f"[Slack] Suspend {int(sec)}s (queued)")
+
+def _send_via_webhook(text: str, payload_extra: dict):
+    if not _WEBHOOK_URL:
+        return
+    body = {"text": text}
+    body.update(payload_extra or {})
+    data = json.dumps(body).encode("utf-8")
+    req = request.Request(_WEBHOOK_URL, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with request.urlopen(req, timeout=8) as resp:
+            # 2xx想定
+            return
+    except error.HTTPError as e:
+        if e.code == 429:
+            # 429: Retry-After が無いケースがある → 既定値でバックオフ
+            ra = e.headers.get("Retry-After") or e.headers.get("retry-after")
+            backoff = float(ra) if ra else _DEFAULT_RETRY_SEC
+            _suspend(backoff)
+            return
+        # その他エラーは標準出力に一度だけ
+        msg = e.read().decode("utf-8", "ignore")
+        print(f"[Slack] webhook error {e.code}: {msg[:200]}")
         return
 
-    # サスペンド中はキューへ積むだけ
-    if time.monotonic() < _SLACK_SUSPEND_UNTIL:
-        _SLACK_QUEUE.append(message)
+def _send_via_webapi(text: str, payload_extra: dict):
+    if not (_BOT_TOKEN and _CHANNEL_ID):
+        return
+    url = "https://slack.com/api/chat.postMessage"
+    body = {"channel": _CHANNEL_ID, "text": text}
+    # blocks等は任意
+    body.update(payload_extra or {})
+    data = json.dumps(body).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {_BOT_TOKEN}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    req = request.Request(url, data=data, headers=headers)
+    try:
+        with request.urlopen(req, timeout=8) as resp:
+            res = json.loads(resp.read().decode("utf-8", "ignore"))
+            if not res.get("ok", False):
+                err = res.get("error", "")
+                if err in ("ratelimited", "message_limit_exceeded", "rate_limited"):
+                    ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                    backoff = float(ra) if ra else _DEFAULT_RETRY_SEC
+                    _suspend(backoff)
+                else:
+                    print(f"[Slack] api error: {err}")
+            return
+    except error.HTTPError as e:
+        if e.code == 429:
+            ra = e.headers.get("Retry-After") or e.headers.get("retry-after")
+            backoff = float(ra) if ra else _DEFAULT_RETRY_SEC
+            _suspend(backoff)
+            return
+        msg = e.read().decode("utf-8", "ignore")
+        print(f"[Slack] api http error {e.code}: {msg[:200]}")
         return
 
-    _slack_refill()
-    if _SLACK_BUCKET["tokens"] >= 1.0:
-        _SLACK_BUCKET["tokens"] -= 1.0
-        try:
-            _send_slack_raw(message)
-        except Exception as e:
-            # 429 → サスペンドし、メッセージをキューへ戻す
-            wait = _retry_after_seconds(e)
-            if wait > 0:
-                _SLACK_BUCKET["tokens"] = 0.0
-                _SLACK_SUSPEND_UNTIL = time.monotonic() + wait
-                _SLACK_QUEUE.append(message)
-                # コンソールだけに簡潔に通知（ループ氾濫を避ける）
-                print(f"[Slack 429] Suspend {wait:.0f}s (queued)")
-            else:
-                # その他のエラーは一度だけ表示して破棄（無限リトライを避ける）
-                print(f"[Slack通知失敗] {e}")
+def _send_one(text: str, payload_extra: dict):
+    global _TOKENS
+    # 優先：Bot Token、無ければWebhook
+    if _BOT_TOKEN and _CHANNEL_ID:
+        _send_via_webapi(text, payload_extra)
     else:
-        _SLACK_QUEUE.append(message)
+        _send_via_webhook(text, payload_extra)
+    _TOKENS -= 1.0
 
-def _flush_slack_queue() -> None:
-    """毎ループで呼ぶ。サスペンド解除後にキューから送信。"""
-    global _SLACK_SUSPEND_UNTIL, _SLACK_BUCKET
-    # サスペンド中は何もしない
-    if time.monotonic() < _SLACK_SUSPEND_UNTIL:
+def _can_send_now() -> bool:
+    if time.monotonic() < _SUSPEND_UNTIL:
+        return False
+    if _TOKENS < 1.0:
+        return False
+    # 最低間隔
+    if (time.monotonic() - _LAST_SEND_AT) < _MIN_INTERVAL_SEC:
+        return False
+    return True
+
+def _flush_once():
+    global _LAST_SEND_AT
+    if not slack_configured():
         return
-
-    _slack_refill()
+    _refill_tokens()
     sent = 0
-    while _SLACK_QUEUE and _SLACK_BUCKET["tokens"] >= 1.0:
-        _SLACK_BUCKET["tokens"] -= 1.0
-        msg = _SLACK_QUEUE.pop(0)
-        try:
-            _send_slack_raw(msg)
-            sent += 1
-        except Exception as e:
-            wait = _retry_after_seconds(e)
-            if wait > 0:
-                _SLACK_BUCKET["tokens"] = 0.0
-                _SLACK_SUSPEND_UNTIL = time.monotonic() + wait
-                _SLACK_QUEUE.insert(0, msg)  # 先頭に戻して次回へ
-                print(f"[Slack 429] Suspend {wait:.0f}s (queue back)")
-                break
-            else:
-                # その他のエラーは破棄（無限リトライを避ける）
-                print(f"[Slack通知失敗] {e}")
-                break
+    while _SLACK_QUEUE and _can_send_now() and sent < _DRAIN_PER_FLUSH:
+        text, extra = _SLACK_QUEUE.popleft()
+        _send_one(text, extra or {})
+        _LAST_SEND_AT = time.monotonic()
+        sent += 1
+
+def _flush_slack_queue():
+    # 外部公開：main やワンライナーから呼ぶ
+    _flush_once()
+
+# 互換のため旧名も残す
+flush = _flush_slack_queue
