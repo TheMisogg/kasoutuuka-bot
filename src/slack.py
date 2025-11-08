@@ -22,8 +22,8 @@ def _send_slack_raw(text: str) -> None:
         return
 
 # ========== レート制限 & リトライ（トークンバケット＋Retry-After） ==========
-_SLACK_MIN_INTERVAL = float(getattr(S, "slack_min_interval_sec", 1.2))  # 最短間隔
-_SLACK_BURST        = int(getattr(S, "slack_burst", 4))                 # バースト数
+_SLACK_MIN_INTERVAL = float(getattr(S, "slack_min_interval_sec", 1.0))  # 最短間隔
+_SLACK_BURST        = int(getattr(S, "slack_burst", 6))                 # バースト数
 _SLACK_RETRY_DEFAULT= float(getattr(S, "slack_retry_default_sec", 30))  # Retry-Afterが無い場合の待機
 
 _SLACK_BUCKET = {"tokens": float(_SLACK_BURST), "last": time.monotonic()}
