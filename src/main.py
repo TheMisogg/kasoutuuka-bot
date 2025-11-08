@@ -17,7 +17,7 @@ load_env()
 
 from .config import STRATEGY as S, API
 from .indicators import rsi, macd, atr, sma
-from .slack import notify_slack
+from .slack import notify_slack, _flush_slack_queue
 
 from edge_signal_pack.indicators import adx as ws_adx
 from edge_signal_pack.signal_engine import EdgeSignalEngine

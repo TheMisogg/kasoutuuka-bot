@@ -1,5 +1,7 @@
 
 import os, json, urllib.request
+import os, json, urllib.request, time
+
 
 # --- 追加: STRATEGY を安全に取り込む ---
 try:
