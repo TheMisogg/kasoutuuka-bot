@@ -1,6 +1,21 @@
 
 import os, json, urllib.request
 
+# --- 追加: STRATEGY を安全に取り込む ---
+try:
+    # パッケージ起動（python -m src.main）
+    from .config import STRATEGY as S
+except Exception:
+    try:
+        # 直下起動（python main.py）でも動くように
+        from config import STRATEGY as S
+    except Exception:
+        # どちらも失敗した場合でも落とさないフォールバック
+        class _Empty: 
+            pass
+        S = _Empty()
+
+
 def notify_slack(text: str) -> None:
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url:
