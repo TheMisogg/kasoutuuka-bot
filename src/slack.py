@@ -10,7 +10,6 @@ _DRAIN_PER_FLUSH      = int(os.getenv("SLACK_DRAIN_PER_TICK", "2"))        # 1�
 _DEFAULT_RETRY_SEC    = float(os.getenv("SLACK_RETRY_DEFAULT_SEC", "60"))  # Retry-Afterが無い429用
 # ============================================================
 
-_WEBHOOK_URL   = os.getenv("SLACK_WEBHOOK_URL")
 _BOT_TOKEN     = os.getenv("SLACK_BOT_TOKEN")        # xoxb-...
 _CHANNEL_ID    = os.getenv("SLACK_CHANNEL_ID")       # Cxxxx のID（#general などの名前ではなくID）
 
