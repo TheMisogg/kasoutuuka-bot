@@ -10,17 +10,19 @@ _DRAIN_PER_FLUSH      = int(os.getenv("SLACK_DRAIN_PER_TICK", "2"))        # 1�
 _DEFAULT_RETRY_SEC    = float(os.getenv("SLACK_RETRY_DEFAULT_SEC", "60"))  # Retry-Afterが無い429用
 # ============================================================
 
+_WEBHOOK_URL   = os.getenv("SLACK_WEBHOOK_URL")
 _BOT_TOKEN     = os.getenv("SLACK_BOT_TOKEN")        # xoxb-...
 _CHANNEL_ID    = os.getenv("SLACK_CHANNEL_ID")       # Cxxxx のID（#general などの名前ではなくID）
 
 _SLACK_QUEUE   = deque()      # (text, payload_dict)
 _LAST_SEND_AT  = 0.0
+_LAST_TOKENS_AT= 0.0  
 _TOKENS        = _BURST_TOKENS
 _SUSPEND_UNTIL = 0.0
 _LOCK          = threading.Lock()
 
 def slack_configured() -> bool:
-    return bool(_WEBHOOK_URL or (_BOT_TOKEN and _CHANNEL_ID))
+    return bool((_BOT_TOKEN and _CHANNEL_ID) or _WEBHOOK_URL)
 
 def notify_slack(text: str, **kwargs) -> None:
     """
@@ -30,15 +32,15 @@ def notify_slack(text: str, **kwargs) -> None:
         _SLACK_QUEUE.append((text, kwargs))
 
 def _refill_tokens():
-    global _TOKENS, _LAST_SEND_AT
+    """時間経過で送信トークンを回復。_LAST_SEND_AT は“送信”時のみ更新する。"""
+    global _TOKENS, _LAST_TOKENS_AT
     now = time.monotonic()
-    if _LAST_SEND_AT == 0.0:
-        _LAST_SEND_AT = now
+    if _LAST_TOKENS_AT == 0.0:
+        _LAST_TOKENS_AT = now
         return
-    # トークン回復（1/_MIN_INTERVAL_SEC 件/秒）
-    rate = 1.0 / max(_MIN_INTERVAL_SEC, 0.1)
-    _TOKENS = min(_BURST_TOKENS, _TOKENS + (now - _LAST_SEND_AT) * rate)
-    _LAST_SEND_AT = now
+    rate = 1.0 / max(_MIN_INTERVAL_SEC, 0.1)  # 1件 / _MIN_INTERVAL_SEC 秒
+    _TOKENS = min(_BURST_TOKENS, _TOKENS + (now - _LAST_TOKENS_AT) * rate)
+    _LAST_TOKENS_AT = now
 
 def _suspend(sec: float):
     global _SUSPEND_UNTIL
@@ -104,13 +106,14 @@ def _send_via_webapi(text: str, payload_extra: dict):
         return
 
 def _send_one(text: str, payload_extra: dict):
-    global _TOKENS
+    global _TOKENS, _LAST_SEND_AT
     # 優先：Bot Token、無ければWebhook
     if _BOT_TOKEN and _CHANNEL_ID:
         _send_via_webapi(text, payload_extra)
     else:
         _send_via_webhook(text, payload_extra)
     _TOKENS -= 1.0
+    _LAST_SEND_AT = time.monotonic()
 
 def _can_send_now() -> bool:
     if time.monotonic() < _SUSPEND_UNTIL:
@@ -131,7 +134,6 @@ def _flush_once():
     while _SLACK_QUEUE and _can_send_now() and sent < _DRAIN_PER_FLUSH:
         text, extra = _SLACK_QUEUE.popleft()
         _send_one(text, extra or {})
-        _LAST_SEND_AT = time.monotonic()
         sent += 1
 
 def _flush_slack_queue():
