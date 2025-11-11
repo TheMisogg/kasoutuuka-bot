@@ -142,15 +142,28 @@ class _DailyTextLogger:
 _TEXTLOG = _DailyTextLogger(S.timezone if hasattr(S, "timezone") else "Asia/Tokyo")
 
 def _should_send_to_slack(text: str) -> bool:
-    """Slackへ送るのは『エントリー/利確/損切』のみ"""
+    """Slackへ送るのは『エントリー/利確/損切』＋（任意で）起動系"""
     if not text:
         return False
     t = str(text).strip()
-    return (
+
+    # 成果通知（必ずSlackへ）
+    if (
         t.startswith("💰 エントリー")
         or t.startswith("✅ 利確")
         or t.startswith("🛑 損切")
-    )
+    ):
+        return True
+
+    # --- 起動系はオプションでSlackへ（既定: True）---
+    if getattr(S, "slack_boot_notify", True):
+        if (
+            t.startswith("🟢 起動")
+            or t.startswith("🚀 起動ステータス")
+            or t.startswith("👀 監視開始")
+            or ("EdgeSignalEngine 起動" in t)
+        ):
+            return True
 
 def notify_slack(text: str, **kwargs) -> None:
     """
