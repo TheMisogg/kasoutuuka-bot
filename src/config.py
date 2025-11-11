@@ -232,7 +232,7 @@ class StrategyConfig:
     ofi_z_clip: float = 6.0
 
     # --- debug ---
-    debug_flow: bool = True  # OFI z などのフロー系デバッグをSlackへ出す
+    debug_flow: bool = False  # OFI z などのフロー系デバッグをSlackへ出す
 
     allow_atomic_flip = False         # 既定は反転しない
     min_hold_minutes_after_entry = 5  # 建ててから最低5分は反転しない
@@ -320,6 +320,9 @@ class StrategyConfig:
 
     # 逆張りを許可するか（デフォルト：禁止）
     allow_countertrend: bool = False
+
+    debug_boot = False  # 起動時のDEBUG通知を出すなら True
+
 APP = AppConfig()
 API = ApiConfig()
 STRATEGY = StrategyConfig()

@@ -10,6 +10,9 @@ from types import ModuleType
 from statistics import median
 from zoneinfo import ZoneInfo
 from typing import Dict, Any
+from pathlib import Path
+from . import slack as _slk  # 既存の from .slack import notify_slack があってもOK（後で上書きします）
+
 
 # .env 読み込み
 from .env import load_env
@@ -51,10 +54,122 @@ except Exception:
 _DEF_OB_DEPTH = getattr(S, "ob_depth", 50)
 
 try:
-    notify_slack(f"[DEBUG] using bybit module: {getattr(_bx, '__file__', 'N/A')}")
-    notify_slack(f"[DEBUG] has place_linear_market_order? {hasattr(_bx, 'place_linear_market_order') if _bx else False}")
+    if bool(getattr(S, "debug_boot", False)):
+        notify_slack(f"[DEBUG] using bybit module: {getattr(_bx, '__file__', 'N/A')}")
+        notify_slack(f"[DEBUG] has place_linear_market_order? {hasattr(_bx, 'place_linear_market_order') if _bx else False}")
 except Exception:
     pass
+
+# ===== 日次テキストロガー & Slackフィルタ ================================
+from zoneinfo import ZoneInfo  # 既にimport済みなら重複OK
+
+class _DailyTextLogger:
+    """
+    ・JST日付ごとのテキストファイル（./logs/YYYY-MM-DD.txt）に追記
+    ・“1本の足で発生するログ束”をバッファし、終端イベントでまとめて書き出す
+    """
+    def __init__(self, tz: str = "Asia/Tokyo"):
+        self.tz = ZoneInfo(tz)
+        self.bundle_key = None          # 例: 足の start(ms)
+        self.bundle_lines: list[str] = []
+        self.base_dir = Path("logs")
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+
+    def _jst_now(self):
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).astimezone(self.tz)
+
+    def _date_key(self) -> str:
+        return self._jst_now().strftime("%Y-%m-%d")
+
+    def _file_path(self) -> Path:
+        return self.base_dir / f"{self._date_key()}.txt"
+
+    def start_bundle(self, key):
+        # 直前の束が残っていれば一度吐き出してから開始
+        if self.bundle_lines:
+            self.flush(force=True)
+        self.bundle_key = key
+        self.bundle_lines = []
+
+    def add_line(self, text: str):
+        if text is None:
+            return
+        self.bundle_lines.append(str(text).rstrip("\n"))
+
+    def _is_terminal(self, text: str) -> bool:
+        """束を締める合図となる行かどうか"""
+        if not text:
+            return False
+        t = str(text).strip()
+        # スキップ（各種）
+        if t.startswith("ℹ️ スキップ") or t.startswith(":インフォメーション: スキップ"):
+            return True
+        # エントリー（PostOnly経由も最終的にはここへ）
+        if t.startswith("💰 エントリー"):
+            return True
+        # PostOnly未充足 → 監視移行（その足の束は締めてよい）
+        if ("PostOnly未充足" in t) or ("監視に移行" in t):
+            return True
+        # 発注失敗/APIエラーなど、その足の決着がつく系
+        if t.startswith(":x:"):
+            return True
+        return False
+
+    def flush(self, force: bool = False):
+        """現在の束をファイルへ出力（force=True か 終端イベント時）"""
+        if not self.bundle_lines:
+            return
+        path = self._file_path()
+        ts = self._jst_now().strftime("%H:%M:%S")
+        header = f"--- [{ts}] bundle key={self.bundle_key} ---"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(header + "\n")
+            for ln in self.bundle_lines:
+                f.write(ln + "\n")
+            f.write("\n")
+        # 次の束に備えてクリア
+        self.bundle_lines = []
+        self.bundle_key = None
+
+# グローバルなロガー（S.timezone が無ければ Asia/Tokyo）
+_TEXTLOG = _DailyTextLogger(S.timezone if hasattr(S, "timezone") else "Asia/Tokyo")
+
+def _should_send_to_slack(text: str) -> bool:
+    """Slackへ送るのは『エントリー/利確/損切』のみ"""
+    if not text:
+        return False
+    t = str(text).strip()
+    return (
+        t.startswith("💰 エントリー")
+        or t.startswith("✅ 利確")
+        or t.startswith("🛑 損切")
+    )
+
+def notify_slack(text: str, **kwargs) -> None:
+    """
+    中央集約ラッパ：
+      1) ログ束に追加
+      2) 終端なら束をファイルへフラッシュ
+      3) Slackは成果のみ送る（エントリー/利確/損切）
+    """
+    try:
+        # 1) 束へ追加（“束”が未開始の場面でも、まずは束に入れる）
+        _TEXTLOG.add_line(text)
+        # 2) 終端判定 → ファイルへ吐き出す
+        if _TEXTLOG._is_terminal(text):
+            _TEXTLOG.flush(force=True)
+        # 3) Slackへは必要最小限だけ
+        if _should_send_to_slack(text):
+            _slk.notify_slack(text, **(kwargs or {}))
+    except Exception:
+        # 例外時は安全側でSlackだけでも送っておく
+        if _should_send_to_slack(text):
+            try:
+                _slk.notify_slack(text, **(kwargs or {}))
+            except Exception:
+                pass
+
 
 _LOG_ONCE = {}
 def _log_once(key: str, msg: str, interval_sec: float = 60.0):
@@ -1244,9 +1359,12 @@ def run_loop():
                 continue
 
             last_start = rows[closed_idx]["start"]
+
             if last_handled_kline == last_start:
                 time.sleep(float(S.poll_interval_sec))
                 continue
+
+            _TEXTLOG.start_bundle(last_start)
 
             relax_note = ""
 
