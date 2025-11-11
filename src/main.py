@@ -27,6 +27,12 @@ from edge_signal_pack.signal_engine import EdgeSignalEngine
 EDGE_ENABLED = True
 edge = None
 
+# Exit Engine 読み込み（存在しなくても起動可）
+try:
+    from .exit_engine import evaluate as _exit_evaluate
+except Exception:
+    _exit_evaluate = None
+
 # === Orderflow / Orderbook utilities ===
 from .flow_filters import (
     fetch_recent_trades_linear, fetch_orderbook_linear,
@@ -1096,6 +1102,9 @@ def run_loop():
     state = load_state() or {}
     state.setdefault("watch_orders", [])
     state.setdefault("_last_sync", 0.0)  # 追加: 同期タイムスタンプの初期化
+    state.setdefault("sl_grace", {})     # ExitEngine: SL猶予マップ
+    state.setdefault("exit_engine", {})  # ExitEngine: 内部統計
+
     
     # === ニュートラル取引カウントのリセット処理 ===
     # ===== 追加①: bybit関数の参照を上の初期化ブロックに追記 =====
@@ -1436,6 +1445,48 @@ def run_loop():
                 except Exception:
                     pass
             
+            # ==== ExitEngine用の軽量コンテキスト/板・約定を先に準備 ====
+            ctx_exit = {
+                "price": c, "high": h, "low": l, "atr": a,
+                "rsi": r, "macd_hist": mh, "sma10": s10, "sma50": s50,
+            }
+            # classify_regime が必要とする最低限キーを埋めて regime を決定
+            _tmp = {
+                "price": c, "atr": a, "sma10": s10, "sma50": s50,
+                "rsi": r, "macd": m, "macd_sig": sgn,
+                "macd_hist": mh, "macd_hist_prev": mh_p,
+                "vwma_fast": vwf, "vwma_slow": vws,
+                "volume": vol_n, "vol_ma": vol_m,
+                "dist_atr": (c - s10) / max(a, 1e-9),
+                "dist_max_atr": 999.0,
+            }
+            ctx_exit["regime"] = classify_regime(_tmp)
+
+            # Orderflow / Orderbook（ExitEngine用）を1回だけ取得
+            try:
+                tdata_ex = fetch_recent_trades_linear(S.symbol, 600)
+                if isinstance(tdata_ex, dict) and "result" in tdata_ex:
+                    tlist_exit = [{
+                        "side": str(t.get("side") or ("Buy" if str(t.get("isBuyerMaker")) == "False" else "Sell")),
+                        "price": float(t["price"]),
+                        "qty": float(t.get("size") or t.get("qty") or 0.0),
+                        "time": int(t["time"]),
+                    } for t in tdata_ex["result"]["list"]]
+                else:
+                    tlist_exit = tdata_ex
+            except Exception:
+                tlist_exit = []
+
+            try:
+                ob_ex = fetch_orderbook_linear(S.symbol, _DEF_OB_DEPTH)
+                if isinstance(ob_ex, dict) and "result" in ob_ex:
+                    bids = [(float(p), float(q)) for p, q in ob_ex["result"].get("b", [])]
+                    asks = [(float(p), float(q)) for p, q in ob_ex["result"].get("a", [])]
+                    book_exit = {"bids": bids, "asks": asks}
+                else:
+                    book_exit = ob_ex
+            except Exception:
+                book_exit = {"bids": [], "asks": []}
             # ※ 建値移動・レンジ用トレールは “ポジの be_k / trail_k” を使う
             still_open = []
             for p in state.get("positions", []):
@@ -1472,6 +1523,101 @@ def run_loop():
                         pass
 
                 closed = False
+                # ==== Exit Engine（動的決済） ====
+                if _exit_evaluate and bool(getattr(S, "exit_engine_enable", True)):
+                    try:
+                        ex = _exit_evaluate(p, ctx_exit, book_exit, tlist_exit, edge, state, S, h, l)
+                    except Exception as _e:
+                        ex = {"action": "HOLD", "reason": f"exit_engine_error:{_e}"}
+
+                    act = (ex or {}).get("action", "HOLD")
+
+                    # --- 1) SL猶予（ヒゲ救済）
+                    if act == "SL_GRACE":
+                        key = str(p.get("time") or "")
+                        state["sl_grace"][key] = time.time() + int(ex.get("grace_sec", 15))
+                        save_state(state)
+                        _log_once(
+                            f"slgrace:{key}",
+                            f"🛟 SL猶予 {int(ex.get('grace_sec',15))}s 開始 | {p_side} | 理由: {ex.get('reason','')}",
+                            interval_sec=15.0
+                        )
+
+                    # --- 2) SL更新（将来拡張用：トレール等）
+                    elif act == "UPDATE_SL":
+                        try:
+                            ns = float(ex.get("new_sl"))
+                            if p_side == "long":
+                                p["sl_price"] = max(float(p.get("sl_price", ep - 9e9)), ns)
+                            else:
+                                p["sl_price"] = min(float(p.get("sl_price", ep + 9e9)), ns)
+                            _log_once(
+                                f"updatesl:{p.get('time','')}",
+                                f"🧷 SL更新 → {float(p['sl_price']):.4f} ({p_side})",
+                                interval_sec=10.0
+                            )
+                        except Exception:
+                            pass
+
+                    elif act in ("TP_PART", "TP_ALL", "CUT"):
+                        if _place_linear_fn:
+                            try:
+                                close_side = "Sell" if p_side == "long" else "Buy"
+                                ratio = 1.0 if act in ("TP_ALL", "CUT") else float(ex.get("ratio", 0.5))
+                                qty_all = float(p["qty"])
+                                qty_close = max(0.0, min(qty_all, qty_all * ratio))
+                                if qty_close > 0:
+                                    res = _place_linear_fn(S.symbol, close_side, qty_close, True)
+                                    if isinstance(res, dict) and res.get("retCode") == 0:
+                                        exit_price = _fill_price_from_res(res, c)  # 無ければ c
+                                        exit_notional = qty_close * exit_price
+                                        if p_side == "long":
+                                            gross = (exit_price - ep) * qty_close
+                                        else:
+                                            gross = (ep - exit_price) * qty_close
+                                        buy_fee_part = float(p.get("buy_fee", 0.0)) * (qty_close / max(qty_all, 1e-9))
+                                        sell_fee = exit_notional * float(getattr(S, "taker_fee_rate", 0.0007))
+                                        net = gross - buy_fee_part - sell_fee
+
+                                        realized_pnl_log.append(net)
+                                        update_trading_state(state, net, net > 0)
+
+                                        # 新シグネチャで呼び出し（RR集計用）
+                                        _on_close_trade(
+                                            state,
+                                            entry=float(ep),
+                                            exit_=float(exit_price),
+                                            side=str(p_side),  # 'long' / 'short'
+                                            risk_sl_dist=float(abs(ep - float(p.get("sl_price", ep)))),
+                                            was_flip=bool(p.get("flip", False)),
+                                        )
+
+                                        remain = qty_all - qty_close
+                                        if remain <= 1e-10:
+                                            p["closed"] = True
+                                            closed = True
+                                            # SL猶予キーを掃除
+                                            try:
+                                                state.get("sl_grace", {}).pop(str(p.get("time") or ""), None)
+                                                save_state(state)
+                                            except Exception:
+                                                pass
+                                            notify_slack(
+                                                f"✅ 利確({p_side}, 早期): {net:+.2f} USDT | {ep:.4f}→{exit_price:.4f} | Qty {qty_close:.4f} | {ex.get('reason','')}"
+                                            )
+                                        else:
+                                            # 残玉へ buy_fee を按分して更新（二重控除防止）
+                                            p["qty"] = remain
+                                            p["buy_fee"] = float(p.get("buy_fee", 0.0)) * (remain / max(qty_all, 1e-9))
+                                            notify_slack(
+                                                f"✅ 利確({p_side}, 部分): {net:+.2f} USDT | {ep:.4f}→{exit_price:.4f} | Qty {qty_close:.4f} | 残 {remain:.4f} | {ex.get('reason','')}"
+                                            )
+                                    else:
+                                        notify_slack(f":x: 早期決済失敗: {res}")
+                            except Exception as e:
+                                notify_slack(f":x: 早期決済APIエラー: {e}")
+                        # act==CUT でもここで全決済済み
+
                 # 利確
                 if ((p_side == "long" and h >= float(p["tp_price"])) or
                     (p_side == "short" and l <= float(p["tp_price"]))) and _place_linear_fn:
@@ -1497,10 +1643,10 @@ def run_loop():
 
                             _on_close_trade(
                                 state,
-                                entry=float(p["entry_price"]),
-                                exit_=float(exit_price),   # その決済価格の変数に合わせてください
-                                side=str(p.get("side","long")),
-                                risk_sl_dist=float(p.get("risk_sl_dist", abs(float(p["entry_price"]) - float(p["sl_price"])))),
+                                entry=float(ep),
+                                exit_=float(exit_price),
+                                side=str(p_side),
+                                risk_sl_dist=float(p.get("risk_sl_dist", abs(ep - float(p.get("sl_price", ep))))),
                                 was_flip=bool(p.get("flip", False)),
                             )
                             closed = True
@@ -1508,11 +1654,31 @@ def run_loop():
                             notify_slack(f":x: 決済失敗: {res}")
                     except Exception as e:
                         notify_slack(f":x: 決済APIエラー: {e}")
-                # 損切
-                if not closed and (
+                # 損切（SLグレース中は保留）
+                sl_grace_ok = True
+                try:
+                    key = str(p.get("time") or "")
+                    now_ts = time.time()
+                    until = float(state.get("sl_grace", {}).get(key, 0.0))
+                    if now_ts < until:
+                        sl_grace_ok = False
+                        _log_once(
+                            f"slgrace_hold:{key}",
+                            "🛟 SL猶予中（決済保留）",
+                            interval_sec=10.0
+                        )
+                    elif until > 0:
+                        # 猶予は終了しているのでクリーンアップ
+                        state["sl_grace"].pop(key, None)
+                        save_state(state)
+                except Exception:
+                    sl_grace_ok = True
+
+                if sl_grace_ok and not closed and (
                     (p_side == "long"  and l <= float(p.get("sl_price", -1))) or
-                    (p_side == "short" and h >= float(p.get("sl_price",  1e9)))
+                    (p_side == "short" and h >= float(p.get("sl_price", 1e9)))
                 ):
+
                     qty = float(p["qty"]) ; sl = float(p["sl_price"]) ; ep = float(p["entry_price"]) ; buy_fee = float(p.get("buy_fee", 0.0))
                     try:
                         if _place_linear_fn:
@@ -1601,7 +1767,7 @@ def run_loop():
                         except Exception:
                             # 取得失敗時はデフォルト(0)のまま
                             pass
-                        reasons = " / ".join(edge.last_reasons)
+                        reasons = " / ".join(getattr(edge, "last_reasons", []) or [])
                         if sig is None:
                             # --- 強フロー例外：regime not ok でも通す ---
                             ofi_th   = float(getattr(S, "regime_override_ofi_z",
@@ -1642,11 +1808,13 @@ def run_loop():
                         if not met and hasattr(edge, "get_metrics_snapshot"):
                             met = edge.get_metrics_snapshot() or {}
                         _log_once(
+                            "dbg_flow_note",
                             f"[DBG] OFI z={float(met.get('ofi_z',0)):.2f} | "
                             f"cons={int(met.get('cons_buy',0))}/{int(met.get('cons_sell',0))} | "
                             f"votes={int(met.get('edge_votes',0))} | "
                             f"ofi_len={int(met.get('ofi_len',0))}/{int(met.get('ofi_win',0))} | "
-                            f"trades seen/added={met.get('dbg_trades_seen','?')}/{met.get('dbg_trades_added','?')}"
+                            f"trades seen/added={met.get('dbg_trades_seen','?')}/{met.get('dbg_trades_added','?')}",
+                            5.0
                         )
                     except Exception:
                         pass

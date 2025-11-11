@@ -323,6 +323,31 @@ class StrategyConfig:
 
     debug_boot = False  # 起動時のDEBUG通知を出すなら True
 
+    # === Exit Engine ===
+    exit_engine_enable: bool = True
+
+    # Near-TP early exit
+    tp_near_bps: float = 10.0            # TPまで10bps以内で監視（=0.10%）
+    tp_near_atr_k: float = 0.10          # あるいは0.10*ATR以内
+    wick_body_ratio_min: float = 2.0     # 上ヒゲが実体の2倍以上
+    early_tp_votes_needed: int = 2       # 反転兆候2つ以上で発火
+
+    # BE/Trail
+    be_trigger_R: float = 0.6
+    trail_step_atr: float = 0.30
+    trail_floor_ma: str = "SMA10"        # ("VWAP"|"SMA10")
+    trail_floor_delta_atr: float = 0.15   # MA−0.15*ATR をフロア
+
+    # SL grace (“ヒゲ救済”)
+    sl_grace_enable: bool = True
+    sl_grace_bps: float = 6.0            # SL±6bps以内なら猶予判定
+    sl_grace_sec: int = 20               # 最大20秒待つ
+    sl_grace_need_votes: int = 2         # 3指標中2つ以上
+
+    # 失速撤退
+    time_stop_min: int = 7
+    min_follow_through_R: float = 0.4
+
 APP = AppConfig()
 API = ApiConfig()
 STRATEGY = StrategyConfig()
