@@ -108,18 +108,32 @@ class _DailyTextLogger:
         if not text:
             return False
         t = str(text).strip()
+
         # スキップ（各種）
         if t.startswith("ℹ️ スキップ") or t.startswith(":インフォメーション: スキップ"):
             return True
+
         # エントリー（PostOnly経由も最終的にはここへ）
         if t.startswith("💰 エントリー"):
             return True
+
         # PostOnly未充足 → 監視移行（その足の束は締めてよい）
         if ("PostOnly未充足" in t) or ("監視に移行" in t):
             return True
+
         # 発注失敗/APIエラーなど、その足の決着がつく系
         if t.startswith(":x:"):
             return True
+
+        # --- 起動系は単独の束として即フラッシュ ---
+        if (
+            t.startswith("🟢 起動")
+            or t.startswith("🚀 起動ステータス")
+            or t.startswith("👀 監視開始")
+            or ("EdgeSignalEngine 起動" in t)
+        ):
+            return True
+
         return False
 
     def flush(self, force: bool = False):
