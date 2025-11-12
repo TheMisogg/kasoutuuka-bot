@@ -11,16 +11,19 @@ from statistics import median
 from zoneinfo import ZoneInfo
 from typing import Dict, Any
 from pathlib import Path
-from . import slack as _slk  # 既存の from .slack import notify_slack があってもOK（後で上書きします）
+
 
 
 # .env 読み込み
 from .env import load_env
 load_env()
 
+from . import slack as _slk
+from .slack import _flush_slack_queue  # ← notify_slack は import しない（後でラッパを定義する）
+
 from .config import STRATEGY as S, API
 from .indicators import rsi, macd, atr, sma
-from .slack import notify_slack, _flush_slack_queue
+
 
 from edge_signal_pack.indicators import adx as ws_adx
 from edge_signal_pack.signal_engine import EdgeSignalEngine
@@ -58,13 +61,6 @@ except Exception:
     _bx = None  
 
 _DEF_OB_DEPTH = getattr(S, "ob_depth", 50)
-
-try:
-    if bool(getattr(S, "debug_boot", False)):
-        notify_slack(f"[DEBUG] using bybit module: {getattr(_bx, '__file__', 'N/A')}")
-        notify_slack(f"[DEBUG] has place_linear_market_order? {hasattr(_bx, 'place_linear_market_order') if _bx else False}")
-except Exception:
-    pass
 
 # ===== 日次テキストロガー & Slackフィルタ ================================
 from zoneinfo import ZoneInfo  # 既にimport済みなら重複OK
@@ -156,50 +152,60 @@ class _DailyTextLogger:
 _TEXTLOG = _DailyTextLogger(S.timezone if hasattr(S, "timezone") else "Asia/Tokyo")
 
 def _should_send_to_slack(text: str) -> bool:
-    """Slackへ送るのは『エントリー/利確/損切』＋（任意で）起動系"""
+    """Slackへ送るのは『エントリー/利確/損切/起動系/日次サマリー』"""
     if not text:
         return False
     t = str(text).strip()
 
-    # 成果通知（必ずSlackへ）
+    # 成果通知
     if (
         t.startswith("💰 エントリー")
         or t.startswith("✅ 利確")
+        or t.startswith("✅ 早期決済")
+        or t.startswith("✅ 部分利確")
         or t.startswith("🛑 損切")
     ):
         return True
 
-    # --- 起動系はオプションでSlackへ（既定: True）---
+    # 日次サマリー
+    if t.startswith("📊") or ("日次サマリー" in t):
+        return True
+
+    # 起動系（オプション）
     if getattr(S, "slack_boot_notify", True):
         if (
             t.startswith("🟢 起動")
             or t.startswith("🚀 起動ステータス")
             or t.startswith("👀 監視開始")
+            or t.startswith("✅ 監視開始")
             or ("EdgeSignalEngine 起動" in t)
         ):
             return True
 
+    return False
+
 def notify_slack(text: str, **kwargs) -> None:
     """
-    中央集約ラッパ：
-      1) ログ束に追加
-      2) 終端なら束をファイルへフラッシュ
-      3) Slackは成果のみ送る（エントリー/利確/損切）
+    1) テキストログ束に追加
+    2) 終端ならファイルへflush
+    3) Slackはフィルタ通過のみ送信し、直後にflush
     """
     try:
-        # 1) 束へ追加（“束”が未開始の場面でも、まずは束に入れる）
         _TEXTLOG.add_line(text)
-        # 2) 終端判定 → ファイルへ吐き出す
         if _TEXTLOG._is_terminal(text):
             _TEXTLOG.flush(force=True)
-        # 3) Slackへは必要最小限だけ
+
         if _should_send_to_slack(text):
             _slk.notify_slack(text, **(kwargs or {}))
+            try:
+                _flush_slack_queue()  # ← 許可メッセージは即時に吐く
+            except Exception:
+                pass
     except Exception:
-        # 例外時は安全側でSlackだけでも送っておく
         if _should_send_to_slack(text):
             try:
                 _slk.notify_slack(text, **(kwargs or {}))
+                _flush_slack_queue()
             except Exception:
                 pass
 
@@ -1327,7 +1333,7 @@ def run_loop():
     # 起動メッセージを即時に出す（レート制限キューに乗ってもここで吐き出す）
     send_startup_status(state)
     _flush_slack_queue()
-    notify_slack("✅ 監視開始（確定足待ち）")
+    notify_slack("👀 監視開始（確定足待ち）")
     _flush_slack_queue()
 
     # ---- 監視/整合チェックをまとめたハウスキーピング ----
@@ -1621,23 +1627,26 @@ def run_loop():
 
                                         remain = qty_all - qty_close
                                         if remain <= 1e-10:
+                                            p["qty"] = 0.0
                                             p["closed"] = True
                                             closed = True
                                             # SL猶予キーを掃除
                                             try:
-                                                state.get("sl_grace", {}).pop(str(p.get("time") or ""), None)
-                                                save_state(state)
+                                                k = str(p.get("time") or "")
+                                                state.get("sl_grace", {}).pop(k, None)
                                             except Exception:
                                                 pass
+                                            save_state(state)
                                             notify_slack(
-                                                f"✅ 利確({p_side}, 早期): {net:+.2f} USDT | {ep:.4f}→{exit_price:.4f} | Qty {qty_close:.4f} | {ex.get('reason','')}"
+                                                f"✅ 早期決済({p_side}): {net:+.2f} USDT | {ep:.4f}→{exit_price:.4f} | Qty {qty_close:.4f} | {ex.get('reason','')}"
                                             )
                                         else:
                                             # 残玉へ buy_fee を按分して更新（二重控除防止）
                                             p["qty"] = remain
                                             p["buy_fee"] = float(p.get("buy_fee", 0.0)) * (remain / max(qty_all, 1e-9))
+                                            save_state(state)
                                             notify_slack(
-                                                f"✅ 利確({p_side}, 部分): {net:+.2f} USDT | {ep:.4f}→{exit_price:.4f} | Qty {qty_close:.4f} | 残 {remain:.4f} | {ex.get('reason','')}"
+                                                f"✅ 部分利確({p_side}): {net:+.2f} USDT | {ep:.4f}→{exit_price:.4f} | Qty {qty_close:.4f} | 残 {remain:.4f} | {ex.get('reason','')}"
                                             )
                                     else:
                                         notify_slack(f":x: 早期決済失敗: {res}")
@@ -1645,38 +1654,56 @@ def run_loop():
                                 notify_slack(f":x: 早期決済APIエラー: {e}")
                         # act==CUT でもここで全決済済み
 
-                # 利確
-                if ((p_side == "long" and h >= float(p["tp_price"])) or
-                    (p_side == "short" and l <= float(p["tp_price"]))) and _place_linear_fn:
-                    qty = float(p["qty"]) ; tp = float(p["tp_price"]) ; ep = float(p["entry_price"]) ; buy_fee = float(p.get("buy_fee", 0.0))
+                
+                # ==== 利確（TP） ====
+                if (
+                    (not closed) and float(p.get("qty", 0.0)) > 1e-12
+                    and (
+                        (p_side == "long"  and h >= float(p.get("tp_price", 1e18))) or
+                        (p_side == "short" and l <= float(p.get("tp_price", -1e18)))
+                    )
+                    and _place_linear_fn
+                ):
+                    qty = float(p.get("qty", 0.0))
+                    tp  = float(p.get("tp_price", 0.0))
+                    ep  = float(p.get("entry_price", 0.0))
+                    buy_fee = float(p.get("buy_fee", 0.0))
                     try:
                         close_side = "Sell" if p_side == "long" else "Buy"
                         res = _place_linear_fn(S.symbol, close_side, qty, True)
                         if isinstance(res, dict) and res.get("retCode") == 0:
-                            exit_notional = qty * tp
+                            exit_price = _fill_price_from_res(res, tp)  # 実約定が取れればそれ、なければtp
+                            exit_notional = qty * exit_price
                             if p_side == "long":
-                                gross = (tp - ep) * qty
+                                gross = (exit_price - ep) * qty
                             else:
-                                gross = (ep - tp) * qty
+                                gross = (ep - exit_price) * qty
                             sell_fee = exit_notional * float(getattr(S, "taker_fee_rate", 0.0007))
                             net = gross - buy_fee - sell_fee
+
                             realized_pnl_log.append(net)
-                            notify_slack(f"✅ 利確({p_side}): {net:+.2f} USDT | {ep:.4f}→{tp:.4f} | Qty {qty:.4f}")
-
                             update_trading_state(state, net, net > 0)
-
-                            exit_price = _fill_price_from_res(res, tp)  # 実約定があればそれ、無ければtp
-                            risk_sl_dist = (ep - float(p["sl_price"])) if p_side == "long" else (float(p["sl_price"]) - ep)
 
                             _on_close_trade(
                                 state,
                                 entry=float(ep),
                                 exit_=float(exit_price),
-                                side=str(p_side),
+                                side=str(p_side),  # 'long' / 'short'
                                 risk_sl_dist=float(p.get("risk_sl_dist", abs(ep - float(p.get("sl_price", ep))))),
                                 was_flip=bool(p.get("flip", False)),
                             )
+
+                            # ローカルを即時クローズ扱いに
+                            p["qty"] = 0.0
+                            p["closed"] = True
                             closed = True
+                            try:
+                                state.get("sl_grace", {}).pop(str(p.get("time") or ""), None)
+                            except Exception:
+                                pass
+                            save_state(state)
+
+                            notify_slack(f"✅ 利確({p_side}): {net:+.2f} USDT | {ep:.4f}→{exit_price:.4f} | Qty {qty:.4f}")
                         else:
                             notify_slack(f":x: 決済失敗: {res}")
                     except Exception as e:
@@ -1701,47 +1728,55 @@ def run_loop():
                 except Exception:
                     sl_grace_ok = True
 
-                if sl_grace_ok and not closed and (
-                    (p_side == "long"  and l <= float(p.get("sl_price", -1))) or
-                    (p_side == "short" and h >= float(p.get("sl_price", 1e9)))
+                if (
+                    sl_grace_ok and (not closed) and float(p.get("qty", 0.0)) > 1e-12
+                    and (
+                        (p_side == "long"  and l <= float(p.get("sl_price", -1))) or
+                        (p_side == "short" and h >= float(p.get("sl_price",  1e9)))
+                    )
                 ):
+                    qty = float(p.get("qty", 0.0))
+                    if qty <= 1e-12:
+                        closed = True  # 念のため：ゼロならスキップ
+                    else:
+                        sl = float(p.get("sl_price", 0.0))
+                        ep = float(p.get("entry_price", 0.0))
+                        try:
+                            if _place_linear_fn:
+                                close_side = "Sell" if p_side == "long" else "Buy"
+                                res = _place_linear_fn(S.symbol, close_side, qty, True)
+                                if isinstance(res, dict) and res.get("retCode") == 0:
+                                    exit_price = _fill_price_from_res(res, sl)
+                                    exit_notional = qty * exit_price
+                                    if p_side == "long":
+                                        gross = (exit_price - ep) * qty
+                                    else:
+                                        gross = (ep - exit_price) * qty
+                                    sell_fee = exit_notional * float(getattr(S, "taker_fee_rate", 0.0007))
+                                    net = gross - buy_fee - sell_fee
+                                    realized_pnl_log.append(net)
+                                    notify_slack(f"🛑 損切({p_side}): {net:+.2f} USDT | {ep:.4f}→{sl:.4f} | Qty {qty:.4f}")
 
-                    qty = float(p["qty"]) ; sl = float(p["sl_price"]) ; ep = float(p["entry_price"]) ; buy_fee = float(p.get("buy_fee", 0.0))
-                    try:
-                        if _place_linear_fn:
-                            close_side = "Sell" if p_side == "long" else "Buy"
-                            res = _place_linear_fn(S.symbol, close_side, qty, True)
-                            if isinstance(res, dict) and res.get("retCode") == 0:
-                                exit_notional = qty * sl
-                                if p_side == "long":
-                                    gross = (sl - ep) * qty
+                                    update_trading_state(state, net, net > 0)
+
+                                    exit_price = _fill_price_from_res(res, sl)
+                                    risk_sl_dist = (ep - float(p["sl_price"])) if p_side == "long" else (float(p["sl_price"]) - ep)
+
+                                    _on_close_trade(
+                                        state,
+                                        entry=float(p["entry_price"]),
+                                        exit_=float(exit_price),   # その決済価格の変数に合わせてください
+                                        side=str(p.get("side","long")),
+                                        risk_sl_dist=float(p.get("risk_sl_dist", abs(float(p["entry_price"]) - float(p["sl_price"])))),
+                                        was_flip=bool(p.get("flip", False)),
+                                    )
+                                    closed = True
                                 else:
-                                    gross = (ep - sl) * qty
-                                sell_fee = exit_notional * float(getattr(S, "taker_fee_rate", 0.0007))
-                                net = gross - buy_fee - sell_fee
-                                realized_pnl_log.append(net)
-                                notify_slack(f"🛑 損切({p_side}): {net:+.2f} USDT | {ep:.4f}→{sl:.4f} | Qty {qty:.4f}")
-
-                                update_trading_state(state, net, net > 0)
-
-                                exit_price = _fill_price_from_res(res, sl)
-                                risk_sl_dist = (ep - float(p["sl_price"])) if p_side == "long" else (float(p["sl_price"]) - ep)
-
-                                _on_close_trade(
-                                    state,
-                                    entry=float(p["entry_price"]),
-                                    exit_=float(exit_price),   # その決済価格の変数に合わせてください
-                                    side=str(p.get("side","long")),
-                                    risk_sl_dist=float(p.get("risk_sl_dist", abs(float(p["entry_price"]) - float(p["sl_price"])))),
-                                    was_flip=bool(p.get("flip", False)),
-                                )
-                                closed = True
+                                    notify_slack(f":x: 損切発注失敗: {res}")
                             else:
-                                notify_slack(f":x: 損切発注失敗: {res}")
-                        else:
-                            notify_slack(":x: 発注関数が見つかりません。")
-                    except Exception as e:
-                        notify_slack(f":x: 損切APIエラー: {e}")
+                                notify_slack(":x: 発注関数が見つかりません。")
+                        except Exception as e:
+                            notify_slack(f":x: 損切APIエラー: {e}")
                 if not closed:
                     still_open.append(p)
             state["positions"] = still_open

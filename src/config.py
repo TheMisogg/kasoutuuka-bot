@@ -348,6 +348,8 @@ class StrategyConfig:
     time_stop_min: int = 7
     min_follow_through_R: float = 0.4
 
+    slack_boot_notify = True
+
 APP = AppConfig()
 API = ApiConfig()
 STRATEGY = StrategyConfig()
