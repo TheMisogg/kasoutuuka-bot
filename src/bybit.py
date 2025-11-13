@@ -34,6 +34,16 @@ def _public_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
+def get_positions_linear(symbol: str) -> Dict[str, Any]:
+    """
+    /v5/position/list のラッパ。
+    main.py 側の `_get_positions_fn` から呼ばれます。
+    """
+    return _private_get("/v5/position/list", {
+        "category": "linear",
+        "symbol": symbol,
+    })
+
 def _private_get(path: str, biz_params: Dict[str, Any]) -> Dict[str, Any]:
     ts = _ts_ms()
     recv_window = 5000
