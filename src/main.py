@@ -1229,26 +1229,51 @@ def run_loop():
             save_state(state)
 
     def _reconcile_with_exchange(current_price: float):
-        """定期的に取引所のネット玉とローカルstateを照合し、乖離時に対処"""
+        """定期的に取引所のポジションとローカルstateを照合し、乖離時に対処する"""
         if not _get_positions_fn:
             return
-        # ローカルのネット数量
-        q_local = 0.0
-        for p in state.get("positions", []):
-            q = float(p.get("qty", 0))
-            q_local += q if (p.get("side","").lower() == "long") else -q
-        # 取引所のネット数量と平均価格
+
+        def _summarize_local():
+            """ローカル state['positions'] からネット数量と加重平均建値を求める"""
+            q_net = 0.0
+            px_sum = 0.0
+            q_sum_abs = 0.0
+            try:
+                for p in state.get("positions", []):
+                    qty = float(p.get("qty") or p.get("size") or 0.0)
+                    if qty <= 0:
+                        continue
+                    side = str(p.get("side", "")).lower()
+                    ep = float(p.get("entry_price") or p.get("avg_px") or 0.0)
+                    signed = qty if side == "long" else -qty
+                    q_net += signed
+                    if ep > 0:
+                        px_sum += ep * qty
+                        q_sum_abs += qty
+            except Exception:
+                pass
+            avg_px = (px_sum / q_sum_abs) if q_sum_abs > 0 else 0.0
+            return q_net, avg_px
+
+        # ローカル側のネットポジション
+        q_local, avg_px_local = _summarize_local()
+
+        # 取引所側のネットポジションと平均価格
         try:
             res = _get_positions_fn(S.symbol)
         except Exception:
             return
+
         items = []
         if isinstance(res, dict):
             r = res.get("result") or res.get("data") or res
             items = r.get("list") or r.get("positions") or r.get("data") or []
         elif isinstance(res, list):
             items = res
-        q_ex, px_sum, q_sum = 0.0, 0.0, 0.0
+
+        q_ex_net = 0.0
+        px_sum = 0.0
+        q_sum_abs = 0.0
         for it in items:
             q = it.get("size") or it.get("qty") or it.get("positionQty")
             q = float(q or 0.0)
@@ -1256,34 +1281,39 @@ def run_loop():
                 continue
             side = (it.get("side") or it.get("positionSide") or "").lower()
             ep = float(it.get("avgPrice") or it.get("entryPrice") or 0.0)
-            if side in ("buy","long"):
-                q_ex += q
-            elif side in ("sell","short"):
-                q_ex -= q
+            if side in ("buy", "long"):
+                signed = q
+            elif side in ("sell", "short"):
+                signed = -q
             else:
-                q_ex += q if q > 0 else -q
+                signed = q if q > 0 else -q
+            q_ex_net += signed
             if ep > 0:
-                px_sum += ep * q
-                q_sum  += q
-        avg_px_ex = (px_sum / q_sum) if q_sum > 0 else 0.0
+                px_sum += ep * abs(q)
+                q_sum_abs += abs(q)
+
+        q_ex_abs = abs(q_ex_net)
+        avg_px_ex = (px_sum / q_sum_abs) if q_sum_abs > 0 else 0.0
 
         tol = float(getattr(S, "sync_tolerance_qty", 1e-6))
-        if abs(q_ex - q_local) <= tol:
-            return  # 整合
 
-        # 乖離対処：①自動クローズ（希望時） ②ローカルへ取り込み
-        if bool(getattr(S, "auto_flatten_on_desync", False)) and abs(q_ex) > 0:
-            try:
-                close_side = "Sell" if q_ex > 0 else "Buy"
-                q_to_close = abs(q_ex)
-                if _place_linear_fn:
-                    res = _place_linear_fn(S.symbol, close_side, q_to_close, True)
-                    notify_slack(f"🚨 自動解消(desync): {close_side} {q_to_close:.4f} reduce-only | ret={res}")
-            except Exception as e:
-                notify_slack(f":x: 自動解消失敗: {e}")
-        else:
-            side = "LONG" if q_ex > 0 else "SHORT"
-            # 取り込み時のTP/SLは現在のATR/プロファイルで安全側に再設定
+        # 1) 双方ほぼフラット
+        if q_ex_abs <= tol and abs(q_local) <= tol:
+            return
+
+        # 2) 取引所=フラット / ローカルだけポジションあり → ローカルをクリーンアップ
+        if q_ex_abs <= tol and abs(q_local) > tol:
+            notify_slack(
+                f"⚠️ 取引所=フラットだがローカルにポジションが残っています "
+                f"(net={q_local:.4f} @≈{avg_px_local:.4f}) → ローカルstateをリセットします"
+            )
+            state["positions"] = []
+            save_state(state)
+            return
+
+        # 3) ローカル=フラット / 取引所だけポジションあり → 取引所を真として取り込み
+        if q_ex_abs > tol and abs(q_local) <= tol:
+            side = "LONG" if q_ex_net > 0 else "SHORT"
             prof = _decide_tp_sl_profile("neutral", side, 0, 0.0, None, S)
             atr_v = float(state.get("atr_buf", [0.0])[-1] if state.get("atr_buf") else 0.0)
             sl_k  = float(prof.get("sl_k", 1.0))
@@ -1295,21 +1325,56 @@ def run_loop():
             else:
                 sl = base + sl_d
                 tp = base - float(prof.get("tp_rr", 1.5)) * sl_d
-            _adopt_position_from_fill(side, abs(q_ex), base, tp, sl, prof, {})
-            notify_slack("⚠️ 取引所≠ローカルの不整合を検知 → ローカルに反映しました")
-    # 状態初期化時に追加
-    if "last_neutral_reset" not in state:
-        state["last_neutral_reset"] = datetime.utcnow().isoformat()
 
-    # 1時間ごとにリセット
-    last_reset = datetime.fromisoformat(state.get("last_neutral_reset", datetime.utcnow().isoformat()))
-    if (datetime.utcnow() - last_reset).total_seconds() >= 3600:
-        state["neutral_trade_count"] = 0
-        state["last_neutral_reset"] = datetime.utcnow().isoformat()
-        save_state(state)  # リセット時に状態を保存
+            notify_slack(
+                f"⚠️ 取引所にのみポジションを検知 → ローカルへ取り込み: "
+                f"side={side} qty={q_ex_abs:.4f} entry≈{base:.4f} TP≈{tp:.4f} SL≈{sl:.4f}"
+            )
+            # 念のため既存ローカルはクリアしてから採用
+            state["positions"] = []
+            _adopt_position_from_fill(side, q_ex_abs, base, tp, sl, prof, {})
+            return
 
-    # OB 持続偏りの履歴（ask/bid の移動平均を取る）
-    state.setdefault("ob_hist", [])
+        # 4) 双方にポジションはあるが数量がほぼ同じ → 微小誤差は無視
+        if abs(q_ex_net - q_local) <= tol:
+            return
+
+        # 5) 双方にポジションがあるが、数量 or 向きが違う
+        if bool(getattr(S, "auto_flatten_on_desync", False)) and q_ex_abs > 0:
+            # オプション: 自動クローズモード
+            try:
+                close_side = "Sell" if q_ex_net > 0 else "Buy"
+                q_to_close = q_ex_abs
+                if _place_linear_fn:
+                    res = _place_linear_fn(S.symbol, close_side, q_to_close, True)
+                    notify_slack(
+                        f"🚨 自動解消(desync): {close_side} {q_to_close:.4f} reduce-only | ret={res}"
+                    )
+                    state["positions"] = []
+                    save_state(state)
+            except Exception as e:
+                notify_slack(f":x: 自動解消失敗(desync): {e}")
+            return
+
+        # auto_flatten_on_desync=False の場合:
+        # 取引所の状態を真としてローカルを上書きする
+        side = "LONG" if q_ex_net > 0 else "SHORT"
+        prof = _decide_tp_sl_profile("neutral", side, 0, 0.0, None, S)
+        atr_v = float(state.get("atr_buf", [0.0])[-1] if state.get("atr_buf") else 0.0)
+        sl_k  = float(prof.get("sl_k", 1.0))
+        sl_d  = max(sl_k * atr_v, float(getattr(S, "min_sl_usd", 0.20)))
+        base  = avg_px_ex or current_price
+        if side == "LONG":
+            sl = base - sl_d
+            tp = base + float(prof.get("tp_rr", 1.5)) * sl_d
+        else:
+            sl = base + sl_d
+            tp = base - float(prof.get("tp_rr", 1.5)) * sl_d
+
+        notify_slack("⚠️ ローカルと取引所のポジション数量が不一致です → 取引所の状態でローカルを上書きします")
+        state["positions"] = []
+        _adopt_position_from_fill(side, q_ex_abs, base, tp, sl, prof, {})
+
     
     # ---- Orderbook ask/bid 比を簡易算出（上位 depth で合計）----
     def _compute_ask_bid_ratio(book: dict, depth: int = 50) -> float:
